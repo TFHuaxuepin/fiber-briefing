@@ -263,6 +263,18 @@ async function main(){
   const briefings=fs.readdirSync(SITE_DIR).filter(f=>/^\d{4}-\d{2}-\d{2}\.html$/.test(f)).map(f=>({file:f,date:f.replace('.html','')})).sort((a,b)=>b.date.localeCompare(a.date));
   fs.writeFileSync(path.join(SITE_DIR,'index.html'), renderIndex(briefings),'utf-8');
   console.log(`完成，共 ${briefings.length} 期简报`);
+
+  // 输出推送摘要（供 notify.js 使用）
+  try{
+    fs.writeFileSync(path.join(__dirname,'..','notify.json'), JSON.stringify({
+      date: dateStr,
+      range: rangeStr,
+      sources: sources.length,
+      degraded: !LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
+      points: (data.highpoints||[]).map(h=>({tag:h.tag,text:h.text})).slice(0,5),
+      sections: (data.sections||[]).map(s=>s.title),
+    },null,2),'utf-8');
+  }catch{}
 }
 
 main().catch(e=>{ console.error('失败:',e); process.exit(1); });
