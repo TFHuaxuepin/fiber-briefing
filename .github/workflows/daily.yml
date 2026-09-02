@@ -16,6 +16,8 @@ jobs:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+      SITE_BASE: https://tfhuaxuepin.github.io/fiber-briefing
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
@@ -47,3 +49,7 @@ jobs:
           publish_dir: ./site
           keep_files: true
           commit_message: 'briefing update ${{ github.run_id }}'
+
+      - name: WeChat push via ServerChan (微信推送)
+        run: node scripts/notify.js
+        continue-on-error: true
