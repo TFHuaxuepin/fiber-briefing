@@ -91,6 +91,46 @@ async function fetchWechatArticle(url){
   return { title, text, length:text.length };
 }
 
+// ===== Bing 转载源搜索（微信正文被反爬拦截时的补充渠道） =====
+let bingCookie='';
+async function bingEnsureCookie(){
+  if(bingCookie) return;
+  try{
+    const resp=await request('https://www.bing.com/',{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
+    bingCookie=(resp.headers['set-cookie']||[]).map(c=>String(c).split(';')[0]).join('; ');
+  }catch{}
+}
+async function bingSearch(q){
+  await bingEnsureCookie();
+  const url='https://www.bing.com/search?q='+encodeURIComponent(q)+'&count=10&mkt=zh-CN';
+  const resp=await request(url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie,'Referer':'https://www.bing.com/'});
+  if(resp.status!==200) return [];
+  const html=resp.body.toString('utf-8');
+  const out=[];
+  for(const m of html.matchAll(/<li class="b_algo"[^>]*>[\s\S]*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)){
+    out.push({url:m[1], title:m[2].replace(/<[^>]+>/g,'').trim()});
+  }
+  return out;
+}
+function titleOverlap(a,b){
+  const na=String(a||'').replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g,'');
+  const nb=String(b||'').replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g,'');
+  if(!na||!nb) return 0;
+  for(let len=Math.min(na.length,20);len>=6;len--){
+    for(let i=0;i+len<=na.length;i++){
+      if(nb.includes(na.slice(i,i+len))) return len;
+    }
+  }
+  return 0;
+}
+function extractReadableText(html){
+  if(!cheerio) return '';
+  const $=cheerio.load(html);
+  $('script,style,noscript,nav,header,footer,aside,iframe').remove();
+  const text=$('body').text()||'';
+  return text.replace(/[ \t\u00a0]+/g,' ').replace(/\n\s*\n\s*\n+/g,'\n\n').trim();
+}
+
 // ===== 抓取 =====
 async function fetchAll(){
   const all=[], seen=new Set();
@@ -112,6 +152,7 @@ async function enrichArticles(list){
   for(const a of list){
     let content='';
     let realUrl=a.url;
+    let contentFrom='weixin';
     try{
       if(a.url.includes('mp.weixin.qq.com')) realUrl=a.url;
       else realUrl=await resolveRealUrl(a.url);
@@ -121,8 +162,25 @@ async function enrichArticles(list){
         content=art.text||'';
       }
     }catch(e){ console.error(`抓取正文失败: ${e.message}`); }
-    out.push({ ...a, realUrl:realUrl||a.url, content });
-    console.log(`  [${a.source}] 正文 ${content.length} 字`);
+    // 微信正文拿不到时，通过 Bing 找该文章的转载源（财经网站等）
+    if(!content){
+      try{
+        const results=await bingSearch(a.title.slice(0,38));
+        for(const r of results.slice(0,4)){
+          if(/mp\.weixin\.qq\.com|weixin\.sogou\.com/.test(r.url)) continue;
+          if(titleOverlap(a.title,r.title)<6) continue;
+          await sleep(600);
+          try{
+            const resp=await request(r.url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
+            if(resp.status!==200) continue;
+            const text=extractReadableText(resp.body.toString('utf-8'));
+            if(text.length>500){ content=text.slice(0,3000); contentFrom=new URL(r.url).hostname; break; }
+          }catch{}
+        }
+      }catch{}
+    }
+    out.push({ ...a, realUrl:realUrl||a.url, content, contentFrom });
+    console.log(`  [${a.source}] 正文 ${content.length} 字${content?`（来源:${contentFrom}）`:''}`);
   }
   return out;
 }
@@ -144,7 +202,7 @@ async function callLLM(prompt){
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
-  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
+  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}${a.contentFrom&&a.contentFrom!=='weixin'?` | 正文转载自:${a.contentFrom}`:''}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
   return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业微信公众号推文素材，梳理整合为一份精炼的行业信息简报。
 
 ${mats}

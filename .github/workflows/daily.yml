@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# 并发锁：防止 GitHub 延迟触发的重复运行导致重复推送
+concurrency:
+  group: daily-briefing
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
