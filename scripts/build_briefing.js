@@ -11,14 +11,27 @@ const zlib = require('zlib');
 const { searchWechatArticles } = require('./search_wechat.js');
 
 // ===== 配置 =====
-const ACCOUNTS = ['化纤头条', '中国化学纤维工业协会', '化纤邦', '华瑞信息'];
+// 账号别名匹配：华瑞信息的实际公众号名为"华瑞CCF化纤信息网"，需用别名覆盖
+const ACCOUNTS = ['化纤头条', '华瑞CCF', '华瑞信息', 'CCFEI', '化纤邦', '中国化学纤维工业协会'];
+// 关键词矩阵：搜狗按相关性排序且无账号级检索，只能靠关键词广撒网提升召回
 const KEYWORDS = [
   { kw: '化纤', n: 50 },
   { kw: '化学纤维', n: 30 },
+  { kw: '纤维', n: 30 },
+  { kw: '涤纶', n: 30 },
+  { kw: '长丝', n: 20 },
+  { kw: 'PTA', n: 20 },
+  { kw: '乙二醇', n: 20 },
+  { kw: '聚酯', n: 20 },
+  { kw: '锦纶', n: 15 },
+  { kw: '氨纶', n: 15 },
+  { kw: '粘胶', n: 15 },
+  { kw: '短纤', n: 15 },
+  { kw: '瓶片', n: 15 },
   { kw: '化纤头条', n: 30 },
   { kw: '化纤邦', n: 30 },
-  { kw: '华瑞信息', n: 30 },
-  { kw: '中国化学纤维工业协会', n: 30 },
+  { kw: '华瑞', n: 30 },
+  { kw: '中国化学纤维工业协会', n: 20 },
 ];
 const EXT_KEYWORDS = ['化纤', '纤维', '涤纶', 'PTA', '锦纶', '氨纶', '粘胶', '腈纶', '长丝', '聚酯'];
 const SITE_DIR = path.join(__dirname, '..', 'site');
@@ -116,7 +129,7 @@ async function enrichArticles(list){
 
 // ===== DeepSeek 整合 =====
 async function callLLM(prompt){
-  const body=JSON.stringify({ model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:3500, response_format:{type:'json_object'} });
+  const body=JSON.stringify({ model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000, response_format:{type:'json_object'} });
   const result=await new Promise((resolve,reject)=>{
     const u=new URL(LLM_BASE.replace(/\/$/,'')+'/chat/completions');
     const req=https.request({hostname:u.hostname,path:u.pathname+(u.search||''),method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${LLM_API_KEY}`,'Content-Length':Buffer.byteLength(body)}},res=>{
@@ -131,7 +144,7 @@ async function callLLM(prompt){
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
-  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}\n正文:\n${(a.content||a.summary||'').slice(0,3500)}\n链接:${a.url}`).join('\n');
+  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
   return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业微信公众号推文素材，梳理整合为一份精炼的行业信息简报。
 
 ${mats}
@@ -208,7 +221,7 @@ function renderDaily(dateStr,rangeStr,data,sources){
 <div class="card"><h2>今日要点</h2><div class="summary-box"><ul>${hp}</ul></div></div>
 ${secs}
 <div class="card"><h2>本期信息来源</h2><table><tr><th>公众号</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(data.notes||'')}</p></div>
-<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}</div>
+<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}<br>采集方式：搜狗微信搜索关键词矩阵（覆盖指定公众号及行业相关来源），受搜索引擎索引覆盖所限，个别推文可能未被收录</div>
 </div></body></html>`;
 }
 function renderIndex(briefings){
