@@ -96,20 +96,29 @@ let bingCookie='';
 async function bingEnsureCookie(){
   if(bingCookie) return;
   try{
-    const resp=await request('https://www.bing.com/',{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
+    // www.bing.com 在国内会被 302 到 cn.bing.com，直接用 cn.bing.com 更稳
+    const resp=await request('https://cn.bing.com/',{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
     bingCookie=(resp.headers['set-cookie']||[]).map(c=>String(c).split(';')[0]).join('; ');
-  }catch{}
+    console.log(`  [bing] cookie 初始化: status=${resp.status}, ${bingCookie.length} 字节`);
+  }catch(e){ console.error(`  [bing] cookie 失败: ${e.message}`); }
 }
 async function bingSearch(q){
   await bingEnsureCookie();
-  const url='https://www.bing.com/search?q='+encodeURIComponent(q)+'&count=10&mkt=zh-CN';
-  const resp=await request(url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie,'Referer':'https://www.bing.com/'});
-  if(resp.status!==200) return [];
+  const url='https://cn.bing.com/search?q='+encodeURIComponent(q)+'&count=10&mkt=zh-CN&setlang=zh-cn';
+  let resp;
+  try{
+    resp=await request(url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie,'Referer':'https://cn.bing.com/'});
+  }catch(e){ console.error(`  [bing] 请求失败: ${e.message}`); return []; }
+  if(resp.status>=300 && resp.status<400 && resp.headers.location){
+    try{ resp=await request(resp.headers.location,{'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie}); }catch{}
+  }
+  if(resp.status!==200){ console.error(`  [bing] "${q}" 状态: ${resp.status}`); return []; }
   const html=resp.body.toString('utf-8');
   const out=[];
   for(const m of html.matchAll(/<li class="b_algo"[^>]*>[\s\S]*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)){
     out.push({url:m[1], title:m[2].replace(/<[^>]+>/g,'').trim()});
   }
+  console.log(`  [bing] "${q}" 命中 ${out.length} 条`);
   return out;
 }
 function titleOverlap(a,b){
@@ -162,7 +171,7 @@ async function enrichArticles(list){
         content=art.text||'';
       }
     }catch(e){ console.error(`抓取正文失败: ${e.message}`); }
-    // 微信正文拿不到时，通过 Bing 找该文章的转载源（财经网站等）
+    // 微信正文拿不到时，通过 cn.bing.com 找该文章的转载源（财经网站等）
     if(!content){
       try{
         const results=await bingSearch(a.title.slice(0,38));
@@ -172,12 +181,16 @@ async function enrichArticles(list){
           await sleep(600);
           try{
             const resp=await request(r.url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
+            if(resp.status>=300 && resp.status<400 && resp.headers.location){
+              try{ const r2=await request(resp.headers.location,{'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9'}); if(r2.status===200) resp=r2; }catch{}
+            }
             if(resp.status!==200) continue;
             const text=extractReadableText(resp.body.toString('utf-8'));
+            console.log(`    转载候选 [${titleOverlap(a.title,r.title)}字符] ${r.url.slice(0,60)} → 正文 ${text.length} 字`);
             if(text.length>500){ content=text.slice(0,3000); contentFrom=new URL(r.url).hostname; break; }
-          }catch{}
+          }catch(e){ console.error(`    转载抓取失败: ${e.message}`); }
         }
-      }catch{}
+      }catch(e){ console.error(`  Bing 兜底失败: ${e.message}`); }
     }
     out.push({ ...a, realUrl:realUrl||a.url, content, contentFrom });
     console.log(`  [${a.source}] 正文 ${content.length} 字${content?`（来源:${contentFrom}）`:''}`);
