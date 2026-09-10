@@ -98,21 +98,37 @@ let bingCookie='';
 async function bingEnsureCookie(){
   if(bingCookie) return;
   try{
-    // www.bing.com 在国内会被 302 到 cn.bing.com，直接用 cn.bing.com 更稳
-    const resp=await request('https://cn.bing.com/',{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9'});
-    bingCookie=(resp.headers['set-cookie']||[]).map(c=>String(c).split(';')[0]).join('; ');
+    // cn.bing.com 直接访问；跟随重定向并累积 cookie
+    let resp=await request('https://cn.bing.com/',{'User-Agent':UA,'Accept':'text/html,application/xhtml+xml','Accept-Language':'zh-CN,zh;q=0.9'});
+    bingCookie=mergeCookies(bingCookie, resp.headers['set-cookie']);
+    if(resp.status>=300 && resp.status<400 && resp.headers.location){
+      const r2=await request(resp.headers.location,{'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie});
+      bingCookie=mergeCookies(bingCookie, r2.headers['set-cookie']);
+    }
     console.log(`  [bing] cookie 初始化: status=${resp.status}, ${bingCookie.length} 字节`);
   }catch(e){ console.error(`  [bing] cookie 失败: ${e.message}`); }
 }
+function mergeCookies(base, setCookieArr){
+  const map={};
+  for(const c of String(base||'').split(';')){ const k=c.split('=')[0].trim(); if(k) map[k]=c.trim(); }
+  for(const c of (setCookieArr||[])){ const p=String(c).split(';')[0].trim(); const k=p.split('=')[0]; if(k) map[k]=p; }
+  return Object.values(map).join('; ');
+}
 async function bingSearch(q){
   await bingEnsureCookie();
-  const url='https://cn.bing.com/search?q='+encodeURIComponent(q)+'&count=10&mkt=zh-CN&setlang=zh-cn';
+  // 参数用 setmkt 而非 mkt，避免再次触发区域重定向
+  const url='https://cn.bing.com/search?q='+encodeURIComponent(q)+'&count=10&setmkt=zh-CN&setlang=zh-cn';
   let resp;
   try{
-    resp=await request(url,{'User-Agent':UA,'Accept':'text/html,*/*;q=0.8','Accept-Encoding':'identity','Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie,'Referer':'https://cn.bing.com/'});
+    resp=await request(url,{'User-Agent':UA,'Accept':'text/html,application/xhtml+xml','Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie,'Referer':'https://cn.bing.com/'});
   }catch(e){ console.error(`  [bing] 请求失败: ${e.message}`); return []; }
-  if(resp.status>=300 && resp.status<400 && resp.headers.location){
-    try{ resp=await request(resp.headers.location,{'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie}); }catch{}
+  // 跟随重定向（最多2次），每次合并 cookie
+  for(let i=0;i<2 && resp.status>=300 && resp.status<400 && resp.headers.location;i++){
+    try{
+      const r2=await request(resp.headers.location,{'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9','Cookie':bingCookie});
+      bingCookie=mergeCookies(bingCookie, r2.headers['set-cookie']);
+      resp=r2;
+    }catch(e){ break; }
   }
   if(resp.status!==200){ console.error(`  [bing] "${q}" 状态: ${resp.status}`); return []; }
   const html=resp.body.toString('utf-8');
