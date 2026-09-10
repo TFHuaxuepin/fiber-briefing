@@ -33,7 +33,9 @@ const KEYWORDS = [
   { kw: '华瑞', n: 30 },
   { kw: '中国化学纤维工业协会', n: 20 },
 ];
-const EXT_KEYWORDS = ['化纤', '纤维', '涤纶', 'PTA', '锦纶', '氨纶', '粘胶', '腈纶', '长丝', '聚酯'];
+const EXT_KEYWORDS = ['涤纶', '长丝', '短纤', 'PTA', '乙二醇', '聚酯', '锦纶', '氨纶', '粘胶', '腈纶', '丙纶', '维纶', '瓶片', '切片', '再生纤维', '纺丝', '织造', '印染'];
+// 噪音黑名单：这些词会误匹配"纤维/化纤"但与化纤行业资讯无关
+const NOISE_KEYWORDS = ['膳食纤维','玻璃纤维筷子','致癌','手撕','咖啡','麦片','豆浆','食谱','家常','养生','抗癌','排毒','丰胸','减肥','瘦身','美食','烧烤','麻辣','椒麻鸡'];
 const SITE_DIR = path.join(__dirname, '..', 'site');
 const NODE_MODULES = 'C:/Users/24428/.workbuddy/binaries/node/workspace/node_modules';
 let cheerio = null;
@@ -220,17 +222,21 @@ function buildLLMPrompt(articles, dateStr, rangeStr){
 
 ${mats}
 
-要求：
-1. 不要简单罗列推文，要跨文章交叉整合，提炼数据和判断；
-2. 严禁编造素材中没有的数据；某条素材正文为空时只能依据标题/摘要，并在简报中标注"原文暂无法获取"；
-3. 涨用红色、跌用绿色（在 tag 中用 "up"/"down" 标记数字）；
-4. 严格输出如下 JSON（只输出 JSON，不要前后多余文字）：
+【行业边界】
+你关注的是"化纤行业"的核心资讯：涤纶/锦纶/氨纶/粘胶/腈纶等品种的价格涨跌、PTA/乙二醇/聚酯等原料行情、产能开工率、库存变化、进出口数据、产业政策、企业动态、技术创新。以下内容不属于化纤行业简报范畴，请直接忽略：膳食纤维/食物营养、玻璃纤维生活科普与致癌辟谣、微生物纤维素学术论文、木棉纤维实验室研究等与化纤市场无关的内容。
+
+【整合要求】
+1. 你是一名分析师，不是摘要机器人。要跨文章交叉整合——把不同素材里提到同一品种/同一主题的信息合并成一条判断，而不是逐条转述每篇文章；
+2. 每条要点要回答"这对市场意味着什么？"，要有分析师的判断力和洞察力；
+3. 严禁编造素材中没有的具体数据；某条素材正文为空时只能依据标题/摘要做有限推断，不能编造细节；
+4. 涨用红色（tag中标注"up"）、跌用绿色（tag中标注"down"）；
+5. 只输出 JSON，不要前后多余文字：
 {
-  "highpoints": [{"tag":"核心/价格/产业/展望", "text":"带数据和判断的一句话要点"}],
-  "sections": [{"title":"板块名", "paragraphs":["段落文本…"], "table":{"headers":["指标","数值","同比","解读"],"rows":[["…","…","…","…"]]} }],
+  "highpoints": [{"tag":"价格/产业/政策/展望", "text":"一句话要点，带数据支撑和判断"}],
+  "sections": [{"title":"板块名", "paragraphs":["分析段落…"], "table":{"headers":["指标","数值","同比","解读"],"rows":[["…","…","…","…"]]} }],
   "notes":"数据核实与免责说明"
 }
-板块按当天实际内容组织（如行业运行数据、价格动态、企业动向、产业活动、趋势研判等），不硬凑。`;
+板块按当天实际内容组织（价格动态、原料行情、产能变化、企业动向、政策解读、趋势研判等）。全体要点不少于3条、不超过8条。板块按信息密度灵活组织，某个方面没内容就跳过，不硬凑。`;
 }
 
 function safeParseJSON(text){
@@ -314,11 +320,16 @@ async function main(){
   const matched=[], extCand=[];
   for(const a of all){
     if(!isFresh(a,cutoff.getTime())) continue;
+    const hay=(a.title||'')+' '+(a.summary||'');
+    if(NOISE_KEYWORDS.some(k=>hay.includes(k))) continue; // 过滤噪音
     if(isAccountMatch(a.source)) matched.push(a);
-    else if(EXT_KEYWORDS.some(k=>(a.title||'').includes(k)||(a.summary||'').includes(k))) extCand.push(a);
+    else if(EXT_KEYWORDS.some(k=>hay.includes(k))) extCand.push(a);
   }
-  const ext=extCand.sort((x,y)=>String(y.datetime).localeCompare(String(x.datetime))).slice(0,5);
-  const selected=[...matched, ...ext];
+  // 去重：同一标题只留一个
+  const seenTitle=new Set();
+  const dedup=(arr)=>arr.filter(a=>{const t=(a.title||'').slice(0,20); if(seenTitle.has(t))return false; seenTitle.add(t); return true;});
+  const ext=dedup(extCand.sort((x,y)=>String(y.datetime).localeCompare(String(x.datetime)))).slice(0,6);
+  const selected=[...dedup(matched), ...ext];
   console.log(`选定 ${selected.length} 篇（指定 ${matched.length} + 延伸 ${ext.length}）`);
 
   // 抓正文
