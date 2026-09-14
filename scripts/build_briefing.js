@@ -30,6 +30,22 @@ function beijingDateStr(d) { const p = n => String(n).padStart(2, '0'); return `
 function parseBeijing(datetime) { const m = datetime.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/); if (!m) return null; return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]) - 8*60*60*1000); }
 function isFresh(a, cutoff){ const dt = parseBeijing(a.datetime||''); return dt!==null && dt.getTime()>=cutoff; }
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+// 去除大模型可能夹带的 HTML 标签
+function stripTags(s){ return String(s||'').replace(/<[^>]*>/g,'').replace(/&nbsp;/g,' ').trim(); }
+// 对已转义的文本中的涨跌数字着色（+红色 / -绿色，遵循 A 股习惯）
+function colorize(escaped){
+  return String(escaped||'')
+    .replace(/\+\s?\d[\d,]*(?:\.\d+)?\s?%?/g, m=>`<span class="up">${m}</span>`)
+    .replace(/(?<![\d\w])-\s?\d[\d,]*(?:\.\d+)?\s?%?/g, m=>`<span class="down">${m}</span>`);
+}
+// 标签文案映射
+function tagLabel(tag){
+  const t=String(tag||'').toLowerCase();
+  if(t==='up') return '涨';
+  if(t==='down') return '跌';
+  if(t==='stable') return '稳';
+  return tag||'资讯';
+}
 
 function decompress(buffer, encoding){ if(!encoding) return buffer; const e=String(encoding).toLowerCase(); try{ if(e.includes('gzip')) return zlib.gunzipSync(buffer); if(e.includes('deflate')) return zlib.inflateSync(buffer); if(e.includes('br')) return zlib.brotliDecompressSync(buffer); }catch{} return buffer; }
 function request(url, headers, timeoutMs=20000){
@@ -267,11 +283,11 @@ ${mats}
 1. 你是一名分析师，不是摘要机器人。要跨文章交叉整合——把不同素材里提到同一品种/同一主题的信息合并成一条判断，而不是逐条转述每篇文章；
 2. 每条要点要回答"这对市场意味着什么？"，要有分析师的判断力和洞察力；
 3. 严禁编造素材中没有的具体数据；某条素材正文为空时只能依据标题/摘要做有限推断，不能编造细节；
-4. 涨用红色（tag中标注"up"）、跌用绿色（tag中标注"down"）；
+4. **绝对禁止在 text/paragraphs/title/table 任何文本里输出 HTML 标签、CSS 或颜色样式**。涨跌方向只用 tag 字段表达：涨用 "up"、跌用 "down"、持平用 "stable"、其他主题用中文如"原料/产业/政策/展望"。正文中直接写"上涨0.63%"这样的纯文本即可，由前端负责着色；
 5. 只输出 JSON，不要前后多余文字：
 {
-  "highpoints": [{"tag":"价格/产业/政策/展望", "text":"一句话要点，带数据支撑和判断"}],
-  "sections": [{"title":"板块名", "paragraphs":["分析段落…"], "table":{"headers":["指标","数值","同比","解读"],"rows":[["…","…","…","…"]]} }],
+  "highpoints": [{"tag":"up/down/stable/原料/产业/政策/展望", "text":"一句话要点，带数据支撑和判断，纯文本"}],
+  "sections": [{"title":"板块名", "paragraphs":["分析段落…纯文本"], "table":{"headers":["指标","数值","涨跌","解读"],"rows":[["…","…","…","…"]]} }],
   "notes":"数据核实与免责说明"
 }
 板块按当天实际内容组织（价格动态、原料行情、产能变化、企业动向、政策解读、趋势研判等）。全体要点不少于3条、不超过8条。板块按信息密度灵活组织，某个方面没内容就跳过，不硬凑。`;
@@ -305,6 +321,8 @@ td{padding:8px 12px;border:1px solid #eef2f6;color:#4a5b6c}
 tr:nth-child(even) td{background:#fafcfe}
 .flag{display:inline-block;font-size:12px;border-radius:4px;padding:1px 8px;margin-right:6px}
 .flag.hot{background:#fdeeee;color:#c0392b}.flag.mid{background:#fff7e0;color:#8a6d1f}
+.flag.up{background:#fdeeee;color:#c0392b}.flag.down{background:#e8f6ee;color:#27ae60}
+.flag.stable{background:#eef2f6;color:#5b6b7a}
 .up{color:#c0392b;font-weight:600}.down{color:#27ae60;font-weight:600}
 .src{font-size:12.5px;color:#8b99a7;margin-top:8px}.src a{color:#2d72b8;text-decoration:none}.src a:hover{text-decoration:underline}
 .note{font-size:12.5px;color:#93a3b1;margin-top:8px}
@@ -317,26 +335,33 @@ tr:nth-child(even) td{background:#fafcfe}
 function renderSection(sec){
   let h=`<div class="card"><h2>${esc(sec.title)}</h2>`;
   for(const p of (sec.paragraphs||[])){
-    // 简易着色：含"涨/增/升/+"的数字不强行改色，仅按 up/down 标记
-    h+=`<p>${esc(p)}</p>`;
+    h+=`<p>${colorize(esc(stripTags(p)))}</p>`;
   }
   if(sec.table){
-    h+=`<table><tr>`+sec.table.headers.map(x=>`<th>${esc(x)}</th>`).join('')+`</tr>`;
-    for(const row of sec.table.rows){ h+=`<tr>`+row.map(x=>`<td>${esc(x)}</td>`).join('')+`</tr>`; }
+    h+=`<table><tr>`+sec.table.headers.map(x=>`<th>${esc(stripTags(x))}</th>`).join('')+`</tr>`;
+    for(const row of sec.table.rows){ h+=`<tr>`+row.map(x=>`<td>${colorize(esc(stripTags(x)))}</td>`).join('')+`</tr>`; }
     h+=`</table>`;
   }
   h+=`</div>`; return h;
 }
+// 按 tag 生成彩色标签
+function tagClass(tag){
+  const t=String(tag||'').toLowerCase();
+  if(t.includes('up')||t.includes('涨')) return 'up';
+  if(t.includes('down')||t.includes('跌')) return 'down';
+  if(t.includes('stable')||t.includes('持稳')||t.includes('平')) return 'stable';
+  return 'mid';
+}
 function renderDaily(dateStr,rangeStr,data,sources){
-  const hp=(data.highpoints||[]).map(h=>`<li><span class="flag ${h.tag==='价格'?'hot':'mid'}">${esc(h.tag)}</span>${esc(h.text)}</li>`).join('');
+  const hp=(data.highpoints||[]).map(h=>`<li><span class="flag ${tagClass(h.tag)}">${esc(tagLabel(h.tag))}</span>${colorize(esc(stripTags(h.text)))}</li>`).join('');
   const secs=(data.sections||[]).map(renderSection).join('');
   const srcRows=sources.map(s=>`<tr><td>${esc(s.source)}</td><td><a href="${esc(s.url)}" target="_blank">${esc(s.title)}</a></td><td>${esc((s.datetime||'').slice(0,16))}</td></tr>`).join('');
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>化纤行业信息简报 · ${dateStr}</title><style>${CSS}</style></head><body><div class="container">
 <div class="header"><div class="badge">每日信息简报 · 内容整合版</div><h1>化纤行业信息简报</h1><div class="meta">${dateStr} · 统计区间：${rangeStr}（过去24小时，北京时间）</div></div>
 <div class="card"><h2>今日要点</h2><div class="summary-box"><ul>${hp}</ul></div></div>
 ${secs}
-<div class="card"><h2>本期信息来源</h2><table><tr><th>栏目</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(data.notes||'')}</p></div>
-<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}<br>数据来源：华瑞信息CCF化纤信息网（快讯/晨报/日报/视点评论），仅收录过去24小时发布的资讯</div>
+<div class="card"><h2>本期信息来源</h2><table><tr><th>栏目</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(stripTags(data.notes||''))}</p></div>
+<div class="footer">化纤行业信息简报 · 由 GitHub Actions + 大模型每日自动整合 · ${dateStr}<br>数据来源：华瑞信息CCF化纤信息网（快讯/晨报/日报/视点评论），仅收录过去24小时发布的资讯</div>
 </div></body></html>`;
 }
 function renderIndex(briefings){
