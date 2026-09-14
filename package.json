@@ -7,6 +7,7 @@
     "build": "node scripts/build_briefing.js"
   },
   "dependencies": {
-    "cheerio": "^1.0.0"
+    "cheerio": "^1.0.0",
+    "iconv-lite": "^0.7.3"
   }
 }

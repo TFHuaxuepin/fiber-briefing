@@ -23,6 +23,8 @@ jobs:
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+      CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
+      CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
       SITE_BASE: https://tfhuaxuepin.github.io/fiber-briefing
     steps:
       - name: Checkout main
