@@ -193,7 +193,7 @@ async function enrichArticles(list){
 }
 
 // ===== 大模型整合 =====
-function llmCandidates(){
+function llmEndpoints(){
   const base=LLM_BASE.replace(/\/+$/,'');
   // 若 base 已含具体端点，直接用
   if(/\/chat\/completions$/.test(base)) return [base];
@@ -201,6 +201,10 @@ function llmCandidates(){
   if(/\/v1$/.test(base)) return [base+'/chat/completions'];
   // 否则先试 /v1/chat/completions（多数网关），再回退 /chat/completions（DeepSeek 原生）
   return [base+'/v1/chat/completions', base+'/chat/completions'];
+}
+// 模型候选：默认模型优先，其次环境变量指定的模型（去重）
+function llmModels(){
+  return [...new Set(['deepseek-v4-pro', LLM_MODEL].filter(Boolean))];
 }
 function postJSON(url, body){
   return new Promise((resolve,reject)=>{
@@ -213,26 +217,41 @@ function postJSON(url, body){
   });
 }
 async function callLLM(prompt){
-  const mkBody=(useJsonMode)=>JSON.stringify(Object.assign(
-    { model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000 },
-    useJsonMode?{response_format:{type:'json_object'}}:{}
-  ));
-  const urls=llmCandidates();
-  let lastErr='';
-  for(const url of urls){
-    for(const useJsonMode of [true,false]){
-      let result;
-      try{ result=await postJSON(url, mkBody(useJsonMode)); }
-      catch(e){ lastErr=`${e.message} @ ${url}`; console.error(`  请求失败: ${e.message}`); continue; }
-      console.log(`LLM 状态: ${result.status} (model=${LLM_MODEL}, ${url.replace(/^https?:\/\//,'')}${useJsonMode?'':', 无json_mode'})`);
-      if(result.status===404){ lastErr=`404 @ ${url}`; break; } // 换下一个候选路径
-      if(result.status===400 && useJsonMode){ lastErr=`400 @ ${url}`; continue; } // 可能不支持 json_object，去掉后重试
-      if(result.status!==200) throw new Error(`LLM 调用失败(${result.status}): `+result.raw.slice(0,300));
-      const data=JSON.parse(result.raw);
-      return data.choices?.[0]?.message?.content||'';
+  const urls=llmEndpoints(), models=llmModels();
+  // 展开为扁平的尝试列表，顺序清晰：模型 → 端点 → json模式
+  const attempts=[];
+  for(const model of models){
+    for(const url of urls){
+      attempts.push({model,url,jsonMode:true});
+      attempts.push({model,url,jsonMode:false});
     }
   }
-  throw new Error('所有候选端点均失败: '+lastErr);
+  const deadUrls=new Set();
+  const deadModels=new Set();
+  let lastErr='';
+  for(const a of attempts){
+    if(deadUrls.has(a.url)||deadModels.has(a.model)) continue;
+    const body=JSON.stringify(Object.assign(
+      { model:a.model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000 },
+      a.jsonMode?{response_format:{type:'json_object'}}:{}
+    ));
+    let r;
+    try{ r=await postJSON(a.url, body); }
+    catch(e){ lastErr=`${e.message} @ ${a.url}`; continue; }
+    console.log(`LLM 尝试: model=${a.model}, url=${a.url.replace(/^https?:\/\//,'')}, json=${a.jsonMode} => HTTP ${r.status}`);
+    if(r.status===200){
+      let data; try{ data=JSON.parse(r.raw); }catch(e){ lastErr='响应非JSON'; continue; }
+      const content=data.choices?.[0]?.message?.content||'';
+      if(content) return content;
+      lastErr='200 但内容为空'; continue;
+    }
+    lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
+    if(r.status===404){ deadUrls.add(a.url); continue; }      // 端点不存在 → 后续跳过该端点
+    if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ deadModels.add(a.model); continue; }
+    if(r.status===401||r.status===403){ deadModels.add(a.model); continue; } // 鉴权/模型问题 → 换模型
+    // 400 且带 json_mode：去掉 json_mode 后再试（下一个 attempt 已是 json=false）
+  }
+  throw new Error('LLM 全部尝试失败: '+lastErr);
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
@@ -333,7 +352,7 @@ async function main(){
   const now=nowBeijing(), cutoff=new Date(now.getTime()-24*60*60*1000);
   const dateStr=beijingDateStr(now), rangeStr=`${beijingStr(cutoff).slice(0,16)} — ${beijingStr(now).slice(0,16)}`;
   console.log(`生成日期: ${dateStr}，区间: ${rangeStr}`);
-  console.log(`配置：数据源=${DATA_SOURCE}；LLM模型=${LLM_MODEL}；LLM端点=${LLM_BASE}；密钥=${LLM_API_KEY?'已配置('+LLM_API_KEY.length+'位)':'未配置'}`);
+  console.log(`配置：数据源=${DATA_SOURCE}；LLM模型候选=${llmModels().join('/')}；LLM端点=${LLM_BASE}；密钥=${LLM_API_KEY?'已配置('+LLM_API_KEY.length+'位)':'未配置'}`);
 
   // CCF 网页采集（登录→抓列表→抓正文）
   let enriched=[];
@@ -345,26 +364,32 @@ async function main(){
   }
   console.log(`采集完成，共 ${enriched.length} 篇`);
 
-  // 只选今天的新文章
-  const selected=enriched.filter(a=>isFresh(a,cutoff.getTime()));
+  // 只选今天的新文章；若今天暂无可解析文章，退回使用列表中最新的若干篇
+  let selected=enriched.filter(a=>isFresh(a,cutoff.getTime()));
+  let usingFallback=false;
+  if(selected.length===0 && enriched.length>0){
+    selected=enriched.slice(0,10);
+    usingFallback=true;
+    console.log('今日无新增文章，退回使用列表最新的 '+selected.length+' 篇');
+  }
   console.log(`当日文章 ${selected.length} 篇`);
 
   try{ fs.writeFileSync(path.join(__dirname,'..','debug_last.json'), JSON.stringify(enriched,null,2),'utf-8'); }catch{}
 
   let data;
   if(LLM_API_KEY && selected.length>0){
-    console.log('调用 DeepSeek 整合...');
+    console.log('调用大模型整合...');
     try{
       const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
       data=safeParseJSON(resp);
       console.log('整合完成，要点 '+(data.highpoints||[]).length+' 条，板块 '+(data.sections||[]).length+' 个');
     }catch(e){
       console.error('LLM 失败，降级为标题列表: '+e.message);
-      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。' };
+      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。原因：'+e.message };
     }
   }else{
-    console.log('未配置 LLM_API_KEY，生成简单列表版');
-    data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
+    console.log(LLM_API_KEY?('无可用文章（采集到 '+enriched.length+' 篇）'):'未配置 LLM_API_KEY');
+    data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
   fs.mkdirSync(SITE_DIR,{recursive:true});
@@ -385,4 +410,5 @@ async function main(){
   }catch{}
 }
 
-main().catch(e=>{ console.error('失败:',e); process.exit(1); });
+if(require.main===module){ main().catch(e=>{ console.error('失败:',e); process.exit(1); }); }
+module.exports={ callLLM, buildLLMPrompt, llmEndpoints, llmModels };
