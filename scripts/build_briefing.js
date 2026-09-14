@@ -40,11 +40,12 @@ function colorize(escaped){
 }
 // 标签文案映射
 function tagLabel(tag){
-  const t=String(tag||'').toLowerCase();
-  if(t==='up') return '涨';
-  if(t==='down') return '跌';
-  if(t==='stable') return '稳';
-  return tag||'资讯';
+  const t=String(tag||'').trim();
+  const l=t.toLowerCase();
+  if(l==='up'||t==='涨') return '涨';
+  if(l==='down'||t==='跌') return '跌';
+  if(l==='stable'||t==='稳'||t==='稳定'||t==='持平') return '稳';
+  return t||'资讯';
 }
 
 function decompress(buffer, encoding){ if(!encoding) return buffer; const e=String(encoding).toLowerCase(); try{ if(e.includes('gzip')) return zlib.gunzipSync(buffer); if(e.includes('deflate')) return zlib.inflateSync(buffer); if(e.includes('br')) return zlib.brotliDecompressSync(buffer); }catch{} return buffer; }
@@ -374,7 +375,7 @@ function tagClass(tag){
   const t=String(tag||'').toLowerCase();
   if(t.includes('up')||t.includes('涨')) return 'up';
   if(t.includes('down')||t.includes('跌')) return 'down';
-  if(t.includes('stable')||t.includes('持稳')||t.includes('平')) return 'stable';
+  if(t.includes('stable')||t.includes('稳')||t.includes('平')||t.includes('持')) return 'stable';
   return 'mid';
 }
 function renderDaily(dateStr,rangeStr,data,sources){
