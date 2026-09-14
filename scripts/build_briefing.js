@@ -192,20 +192,47 @@ async function enrichArticles(list){
   return out;
 }
 
-// ===== DeepSeek 整合 =====
-async function callLLM(prompt){
-  const body=JSON.stringify({ model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000, response_format:{type:'json_object'} });
-  const result=await new Promise((resolve,reject)=>{
-    const u=new URL(LLM_BASE.replace(/\/$/,'')+'/chat/completions');
-    const req=https.request({hostname:u.hostname,path:u.pathname+(u.search||''),method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${LLM_API_KEY}`,'Content-Length':Buffer.byteLength(body)}},res=>{
-      const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>{ const raw=Buffer.concat(chunks).toString('utf-8'); resolve({status:res.statusCode,raw}); });
+// ===== 大模型整合 =====
+function llmCandidates(){
+  const base=LLM_BASE.replace(/\/+$/,'');
+  // 若 base 已含具体端点，直接用
+  if(/\/chat\/completions$/.test(base)) return [base];
+  // 若 base 已含 /v1，则只试 /chat/completions
+  if(/\/v1$/.test(base)) return [base+'/chat/completions'];
+  // 否则先试 /v1/chat/completions（多数网关），再回退 /chat/completions（DeepSeek 原生）
+  return [base+'/v1/chat/completions', base+'/chat/completions'];
+}
+function postJSON(url, body){
+  return new Promise((resolve,reject)=>{
+    const u=new URL(url);
+    const lib=u.protocol==='http:'?require('http'):https;
+    const req=lib.request({hostname:u.hostname,protocol:u.protocol,path:u.pathname+(u.search||''),method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${LLM_API_KEY}`,'Content-Length':Buffer.byteLength(body)}},res=>{
+      const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>resolve({status:res.statusCode,raw:Buffer.concat(chunks).toString('utf-8')}));
     });
-    req.on('error',reject); req.setTimeout(90000,()=>{req.destroy();reject(new Error('LLM timeout'));}); req.write(body); req.end();
+    req.on('error',reject); req.setTimeout(120000,()=>{req.destroy();reject(new Error('LLM timeout'));}); req.write(body); req.end();
   });
-  console.log(`LLM 状态: ${result.status}`);
-  if(result.status!==200) throw new Error('LLM 调用失败: '+result.raw.slice(0,200));
-  const data=JSON.parse(result.raw);
-  return data.choices?.[0]?.message?.content||'';
+}
+async function callLLM(prompt){
+  const mkBody=(useJsonMode)=>JSON.stringify(Object.assign(
+    { model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000 },
+    useJsonMode?{response_format:{type:'json_object'}}:{}
+  ));
+  const urls=llmCandidates();
+  let lastErr='';
+  for(const url of urls){
+    for(const useJsonMode of [true,false]){
+      let result;
+      try{ result=await postJSON(url, mkBody(useJsonMode)); }
+      catch(e){ lastErr=`${e.message} @ ${url}`; console.error(`  请求失败: ${e.message}`); continue; }
+      console.log(`LLM 状态: ${result.status} (${url.replace(/^https?:\/\//,'')}${useJsonMode?'':', 无json_mode'})`);
+      if(result.status===404){ lastErr=`404 @ ${url}`; break; } // 换下一个候选路径
+      if(result.status===400 && useJsonMode){ lastErr=`400 @ ${url}`; continue; } // 可能不支持 json_object，去掉后重试
+      if(result.status!==200) throw new Error(`LLM 调用失败(${result.status}): `+result.raw.slice(0,300));
+      const data=JSON.parse(result.raw);
+      return data.choices?.[0]?.message?.content||'';
+    }
+  }
+  throw new Error('所有候选端点均失败: '+lastErr);
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){

@@ -5,3 +5,6 @@ site/
 *.log
 
 cmdkey_out.txt
+
+_logs/
+pages_index.html
