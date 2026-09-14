@@ -45,6 +45,35 @@ function request(options) {
   });
 }
 
+// 带重试的请求：遇 429/5xx/超时自动退避重试
+async function requestWithRetry(options, retries = 3) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const resp = await request(options);
+      if (resp.status === 429 || resp.status >= 500) {
+        lastErr = new Error(`HTTP ${resp.status}`);
+        if (i < retries) {
+          const wait = 5000 * (i + 1) + Math.random() * 3000;
+          console.log(`    [重试] HTTP ${resp.status}，等待 ${Math.round(wait / 1000)}s 后重试 (${i + 1}/${retries})`);
+          await sleep(wait);
+          continue;
+        }
+      }
+      return resp;
+    } catch (e) {
+      lastErr = e;
+      if (i < retries) {
+        const wait = 4000 * (i + 1);
+        console.log(`    [重试] ${e.message}，等待 ${Math.round(wait / 1000)}s 后重试 (${i + 1}/${retries})`);
+        await sleep(wait);
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error('request failed');
+}
+
 function mergeCookies(base, arr) {
   const map = {};
   for (const c of String(base || '').split(';')) { const k = c.split('=')[0].trim(); if (k) map[k] = c.trim(); }
@@ -140,7 +169,7 @@ function parseListHtml(html, colName, basePath) {
 async function fetchList(cookies, colId, colName) {
   const url = `${BASE}/newscenter/list-${colId}.shtml`;
   let resp;
-  try { resp = await request({url, headers: {Cookie: cookies}}); }
+  try { resp = await requestWithRetry({url, headers: {Cookie: cookies}}); }
   catch (e) { console.error(`  [CCF] 列表 ${colName} 请求失败: ${e.message}`); return []; }
   if (resp.status !== 200) { console.error(`  [CCF] 列表 ${colName} HTTP ${resp.status}`); return []; }
   const html = decodeGBK(resp.body, resp.headers);
@@ -163,24 +192,52 @@ async function fetchList(cookies, colId, colName) {
   return articles;
 }
 
+// 从 startIdx 处提取配对的 <div>...</div>（正确处理嵌套）
+function extractBalancedDiv(html, startIdx) {
+  const openRe = /<div\b/gi;
+  const closeRe = /<\/div>/gi;
+  openRe.lastIndex = startIdx;
+  const firstOpen = openRe.exec(html);
+  if (!firstOpen) return '';
+  let depth = 1;
+  let pos = firstOpen.index + firstOpen[0].length;
+  while (depth > 0 && pos < html.length) {
+    closeRe.lastIndex = pos;
+    const nextClose = closeRe.exec(html);
+    if (!nextClose) break;
+    // 统计 pos 到 nextClose 之间的 <div
+    const segment = html.slice(pos, nextClose.index);
+    const opens = (segment.match(/<div\b/gi) || []).length;
+    depth += opens;
+    depth -= 1;
+    pos = nextClose.index + nextClose[0].length;
+  }
+  return html.slice(firstOpen.index + firstOpen[0].length, pos - 6);
+}
+
 // ===== 正文抓取 =====
 
 async function fetchContent(cookies, url) {
   let resp;
-  try { resp = await request({url, headers: {Cookie: cookies}}); }
+  try { resp = await requestWithRetry({url, headers: {Cookie: cookies}}); }
   catch (e) { console.error(`  [CCF] 正文请求失败: ${e.message}`); return ''; }
   if (resp.status !== 200) return '';
   const html = decodeGBK(resp.body, resp.headers);
 
-  // 提取 #newscontent 里的正文
-  const ncMatch = html.match(/<div[^>]*id=["']?newscontent["']?[^>]*>([\s\S]*?)<\/div>/i);
-  if (!ncMatch) {
-    // fallback: 提取 newsviewtext
-    const nvMatch = html.match(/<td[^>]*class=["'][^"']*newsviewtext[^"']*["'][^>]*>([\s\S]*?)<\/td>/i);
-    if (!nvMatch) return '';
-    return cleanText(nvMatch[1]);
+  // 优先定位 #newscontent，用配对 div 提取（防止嵌套 div 截断）
+  const ncIdx = html.search(/<div[^>]*id=["']?newscontent["']?/i);
+  if (ncIdx >= 0) {
+    const inner = extractBalancedDiv(html, ncIdx);
+    const text = cleanText(inner);
+    if (text.length > 0) return text;
   }
-  return cleanText(ncMatch[1]);
+  // fallback: 非贪婪匹配
+  const ncMatch = html.match(/<div[^>]*id=["']?newscontent["']?[^>]*>([\s\S]*?)<\/div>/i);
+  if (ncMatch) return cleanText(ncMatch[1]);
+  // 再 fallback: newsviewtext 容器
+  const nvMatch = html.match(/<td[^>]*class=["'][^"']*newsviewtext[^"']*["'][^>]*>([\s\S]*?)<\/td>/i);
+  if (nvMatch) return cleanText(nvMatch[1]);
+  return '';
 }
 
 function cleanText(html) {

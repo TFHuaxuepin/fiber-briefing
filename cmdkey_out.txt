@@ -1,0 +1,40 @@
+
+当前保存的凭据:
+
+    目标: MicrosoftAccount:target=SSO_POP_User:user=zxchuaxin@163.com
+    类型: 普通 
+    用户: zxchuaxin@163.com
+    仅为此登录保存
+    
+    目标: MicrosoftAccount:target=SSO_POP_Device
+    类型: 普通 
+    用户: 02hkqvnkmnosqsdf
+    仅为此登录保存
+    
+    目标: LegacyGeneric:target=git:https://github.com
+    类型: 普通 
+    用户: TFHuaxuepin
+    本地机器持续时间
+    
+    目标: LegacyGeneric:target=MicrosoftOffice16_Data:live:cid=efd9747754ef9656
+    类型: 普通 
+    本地机器持续时间
+    
+    目标: LegacyGeneric:target=MicrosoftAccount:user=zxchuaxin@163.com
+    类型: 普通 
+    用户: zxchuaxin@163.com
+    本地机器持续时间
+    
+    目标: LegacyGeneric:target=JianyingPro Cached Credential
+    类型: 普通 
+    用户: JianyingPro
+    本地机器持续时间
+    
+    目标: WindowsLive:target=virtualapp/didlogical
+    类型: 普通 
+    用户: 02hkqvnkmnosqsdf
+    本地机器持续时间
+    
+    目标: LegacyGeneric:target=MicrosoftOffice16_Data:SSPI:ETRANSFAR\24428
+    类型: 普通 
+    
