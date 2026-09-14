@@ -248,12 +248,12 @@ async function callLLM(prompt){
   for(const a of attempts){
     if(deadUrls.has(a.url)||deadModels.has(a.model)) continue;
     const body=JSON.stringify(Object.assign(
-      { model:a.model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000 },
+      { model:a.model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:8000 },
       a.jsonMode?{response_format:{type:'json_object'}}:{}
     ));
     let r;
     try{ r=await postJSON(a.url, body); }
-    catch(e){ lastErr=`${e.message} @ ${a.url}`; continue; }
+    catch(e){ lastErr=`${e.message} @ ${a.url}`; console.log(`  (尝试失败: ${a.model}/${a.jsonMode?'json':'text'} → ${e.message})`); continue; }
     console.log(`LLM 尝试: model=${a.model}, url=${a.url.replace(/^https?:\/\//,'')}, json=${a.jsonMode} => HTTP ${r.status}`);
     if(r.status===200){
       let data; try{ data=JSON.parse(r.raw); }catch(e){ lastErr='响应非JSON'; continue; }
@@ -271,7 +271,8 @@ async function callLLM(prompt){
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
-  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}${a.contentFrom&&a.contentFrom!=='weixin'?` | 正文转载自:${a.contentFrom}`:''}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
+  // 控制单篇正文长度，避免提示词过长导致输出被截断
+  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}\n正文:\n${(a.content||a.summary||'（正文为空）').slice(0,1500)}\n链接:${a.url}`).join('\n');
   return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业资讯素材（来自华瑞信息CCF快讯/晨报/日报/视点评论），梳理整合为一份精炼的行业信息简报。
 
 ${mats}
@@ -293,11 +294,35 @@ ${mats}
 板块按当天实际内容组织（价格动态、原料行情、产能变化、企业动向、政策解读、趋势研判等）。全体要点不少于3条、不超过8条。板块按信息密度灵活组织，某个方面没内容就跳过，不硬凑。`;
 }
 
+// 补齐未闭合的字符串/括号
+function closeAll(s){
+  const stack=[]; let inStr=false, esc=false;
+  for(const ch of s){
+    if(inStr){ if(esc){esc=false;} else if(ch==='\\'){esc=true;} else if(ch==='"'){inStr=false;} continue; }
+    if(ch==='"') inStr=true;
+    else if(ch==='{') stack.push('}');
+    else if(ch==='[') stack.push(']');
+    else if(ch==='}'||ch===']') stack.pop();
+  }
+  let out=s;
+  if(inStr) out+='"';
+  while(stack.length) out+=stack.pop();
+  return out;
+}
+// 健壮 JSON 解析：容忍大模型输出被 max_tokens 截断
 function safeParseJSON(text){
-  let t=text.trim();
+  let t=String(text||'').trim();
   const fence=t.match(/```(?:json)?\s*([\s\S]*?)```/i); if(fence) t=fence[1].trim();
-  const s=t.indexOf('{'), e=t.lastIndexOf('}'); if(s>=0&&e>s) t=t.slice(s,e+1);
-  return JSON.parse(t);
+  const s=t.indexOf('{'), e=t.lastIndexOf('}');
+  if(s>=0&&e>s) t=t.slice(s,e+1);
+  try{ return JSON.parse(t); }catch(err){}
+  // 修复：从末尾往前找完整的 } / ] 作为截断点，补齐括号后重试
+  const cands=[];
+  for(let i=t.length-1;i>=0 && cands.length<120;i--){ if(t[i]==='}'||t[i]===']') cands.push(i); }
+  for(const p of cands){
+    try{ return JSON.parse(closeAll(t.slice(0,p+1))); }catch(err){}
+  }
+  throw new Error('JSON 解析失败（含修复尝试）');
 }
 
 // ===== HTML 渲染 =====
@@ -407,6 +432,13 @@ async function main(){
     try{
       const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
       data=safeParseJSON(resp);
+      // 兜底：若解析结果缺要点或板块（例如输出被截断），用标题列表补齐
+      if(!Array.isArray(data.highpoints)||data.highpoints.length===0){
+        data.highpoints=selected.slice(0,5).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`}));
+      }
+      if(!Array.isArray(data.sections)||data.sections.length===0){
+        data.sections=[{title:'当日资讯列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime.slice(11,16)}）`)}];
+      }
       console.log('整合完成，要点 '+(data.highpoints||[]).length+' 条，板块 '+(data.sections||[]).length+' 个');
     }catch(e){
       console.error('LLM 失败，降级为标题列表: '+e.message);
