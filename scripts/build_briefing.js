@@ -224,7 +224,7 @@ async function callLLM(prompt){
       let result;
       try{ result=await postJSON(url, mkBody(useJsonMode)); }
       catch(e){ lastErr=`${e.message} @ ${url}`; console.error(`  请求失败: ${e.message}`); continue; }
-      console.log(`LLM 状态: ${result.status} (${url.replace(/^https?:\/\//,'')}${useJsonMode?'':', 无json_mode'})`);
+      console.log(`LLM 状态: ${result.status} (model=${LLM_MODEL}, ${url.replace(/^https?:\/\//,'')}${useJsonMode?'':', 无json_mode'})`);
       if(result.status===404){ lastErr=`404 @ ${url}`; break; } // 换下一个候选路径
       if(result.status===400 && useJsonMode){ lastErr=`400 @ ${url}`; continue; } // 可能不支持 json_object，去掉后重试
       if(result.status!==200) throw new Error(`LLM 调用失败(${result.status}): `+result.raw.slice(0,300));
@@ -333,6 +333,7 @@ async function main(){
   const now=nowBeijing(), cutoff=new Date(now.getTime()-24*60*60*1000);
   const dateStr=beijingDateStr(now), rangeStr=`${beijingStr(cutoff).slice(0,16)} — ${beijingStr(now).slice(0,16)}`;
   console.log(`生成日期: ${dateStr}，区间: ${rangeStr}`);
+  console.log(`配置：数据源=${DATA_SOURCE}；LLM模型=${LLM_MODEL}；LLM端点=${LLM_BASE}；密钥=${LLM_API_KEY?'已配置('+LLM_API_KEY.length+'位)':'未配置'}`);
 
   // CCF 网页采集（登录→抓列表→抓正文）
   let enriched=[];
