@@ -1,49 +1,25 @@
 #!/usr/bin/env node
 /**
- * 化纤行业公众号每日信息简报（云端版）
- * 流程：多关键词搜索 -> 抓取文章正文 -> 调用 DeepSeek 整合为分析师风格简报 -> 渲染 HTML -> 发布
+ * 化纤行业每日信息简报（网页采集版）
+ * 流程：华瑞CCF登录 -> 抓取快讯/晨报/日报/视点正文 -> DeepSeek整合为分析师风格简报 -> 渲染HTML -> 发布
  * 在 GitHub Actions 中运行，无需本机开机。
  */
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const zlib = require('zlib');
-const { searchWechatArticles } = require('./search_wechat.js');
-
-// ===== 配置 =====
-// 账号别名匹配：华瑞信息的实际公众号名为"华瑞CCF化纤信息网"，需用别名覆盖
-const ACCOUNTS = ['化纤头条', '华瑞CCF', '华瑞信息', 'CCFEI', '化纤邦', '中国化学纤维工业协会'];
-// 关键词矩阵：搜狗按相关性排序且无账号级检索，只能靠关键词广撒网提升召回
-const KEYWORDS = [
-  { kw: '化纤', n: 50 },
-  { kw: '化学纤维', n: 30 },
-  { kw: '纤维', n: 30 },
-  { kw: '涤纶', n: 30 },
-  { kw: '长丝', n: 20 },
-  { kw: 'PTA', n: 20 },
-  { kw: '乙二醇', n: 20 },
-  { kw: '聚酯', n: 20 },
-  { kw: '锦纶', n: 15 },
-  { kw: '氨纶', n: 15 },
-  { kw: '粘胶', n: 15 },
-  { kw: '短纤', n: 15 },
-  { kw: '瓶片', n: 15 },
-  { kw: '化纤头条', n: 30 },
-  { kw: '化纤邦', n: 30 },
-  { kw: '华瑞', n: 30 },
-  { kw: '中国化学纤维工业协会', n: 20 },
-];
-const EXT_KEYWORDS = ['涤纶', '长丝', '短纤', 'PTA', '乙二醇', '聚酯', '锦纶', '氨纶', '粘胶', '腈纶', '丙纶', '维纶', '瓶片', '切片', '再生纤维', '纺丝', '织造', '印染'];
-// 噪音黑名单：这些词会误匹配"纤维/化纤"但与化纤行业资讯无关
-const NOISE_KEYWORDS = ['膳食纤维','玻璃纤维筷子','致癌','手撕','咖啡','麦片','豆浆','食谱','家常','养生','抗癌','排毒','丰胸','减肥','瘦身','美食','烧烤','麻辣','椒麻鸡'];
+const { fetchCCFArticles } = require('./ccf.js');
+const CCF_USER = process.env.CCF_USERNAME || '';
+const CCF_PASS = process.env.CCF_PASSWORD || '';
+const DATA_SOURCE = CCF_USER ? '华瑞CCF化纤信息网' : '无（请配置CCF_USERNAME/CCF_PASSWORD）';
 const SITE_DIR = path.join(__dirname, '..', 'site');
 const NODE_MODULES = 'C:/Users/24428/.workbuddy/binaries/node/workspace/node_modules';
 let cheerio = null;
 try { cheerio = require(path.join(NODE_MODULES, 'cheerio')); } catch { try { cheerio = require('cheerio'); } catch {} }
 
 const LLM_API_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || '';
-const LLM_BASE = process.env.LLM_BASE_URL || 'https://api.deepseek.com';
-const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-chat';
+const LLM_BASE = process.env.LLM_BASE_URL || 'https://token.chinaunicomglobal.com';
+const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-v4-pro';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 // ===== 工具 =====
@@ -52,7 +28,6 @@ function nowBeijing() { return new Date(Date.now() + 8 * 60 * 60 * 1000); }
 function beijingStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`; }
 function beijingDateStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}`; }
 function parseBeijing(datetime) { const m = datetime.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/); if (!m) return null; return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]) - 8*60*60*1000); }
-function isAccountMatch(s){ return s && ACCOUNTS.some(a => s.includes(a)); }
 function isFresh(a, cutoff){ const dt = parseBeijing(a.datetime||''); return dt!==null && dt.getTime()>=cutoff; }
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
@@ -60,8 +35,9 @@ function decompress(buffer, encoding){ if(!encoding) return buffer; const e=Stri
 function request(url, headers, timeoutMs=20000){
   return new Promise((resolve,reject)=>{
     const u=new URL(url);
-    const req=https.request({hostname:u.hostname,path:u.pathname+u.search,headers,method:'GET'},res=>{
-      const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}));
+    const lib=u.protocol==='http:'?require('http'):https;
+    const req=lib.request({hostname:u.hostname,protocol:u.protocol,path:u.pathname+u.search,headers,method:'GET'},res=>{
+      const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:decompress(Buffer.concat(chunks),res.headers['content-encoding'])}));
     });
     req.on('error',reject); req.setTimeout(timeoutMs,()=>{req.destroy();reject(new Error('timeout'));}); req.end();
   });
@@ -234,7 +210,7 @@ async function callLLM(prompt){
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
   const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}${a.contentFrom&&a.contentFrom!=='weixin'?` | 正文转载自:${a.contentFrom}`:''}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
-  return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业微信公众号推文素材，梳理整合为一份精炼的行业信息简报。
+  return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业资讯素材（来自华瑞信息CCF快讯/晨报/日报/视点评论），梳理整合为一份精炼的行业信息简报。
 
 ${mats}
 
@@ -313,15 +289,15 @@ function renderDaily(dateStr,rangeStr,data,sources){
 <div class="header"><div class="badge">每日信息简报 · 内容整合版</div><h1>化纤行业信息简报</h1><div class="meta">${dateStr} · 统计区间：${rangeStr}（过去24小时，北京时间）</div></div>
 <div class="card"><h2>今日要点</h2><div class="summary-box"><ul>${hp}</ul></div></div>
 ${secs}
-<div class="card"><h2>本期信息来源</h2><table><tr><th>公众号</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(data.notes||'')}</p></div>
-<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}<br>采集方式：搜狗微信搜索关键词矩阵（覆盖指定公众号及行业相关来源），受搜索引擎索引覆盖所限，个别推文可能未被收录</div>
+<div class="card"><h2>本期信息来源</h2><table><tr><th>栏目</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(data.notes||'')}</p></div>
+<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}<br>数据来源：华瑞信息CCF化纤信息网（快讯/晨报/日报/视点评论），仅收录过去24小时发布的资讯</div>
 </div></body></html>`;
 }
 function renderIndex(briefings){
   const items=briefings.map(b=>`<div class="index-item"><a href="${b.file}">化纤行业信息简报 · ${b.date}</a><span class="date">${b.date}</span></div>`).join('');
   const latest=briefings.length?`<div class="summary-box">最新一期：<a href="${briefings[0].file}">${briefings[0].date} 简报 >></a></div>`:'<div class="index-item">暂无简报</div>';
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>化纤行业信息简报 · 目录</title><style>${CSS}</style></head><body><div class="container">
-<div class="header"><div class="badge">每日信息简报</div><h1>化纤行业信息简报</h1><div class="meta">追踪公众号：${ACCOUNTS.join('、')} · 每日 9:00（北京时间）由 GitHub Actions + DeepSeek 自动整合</div></div>
+<div class="header"><div class="badge">每日信息简报</div><h1>化纤行业信息简报</h1><div class="meta">数据来源：${DATA_SOURCE} · 每日 9:00（北京时间）由 GitHub Actions + DeepSeek 自动整合</div></div>
 ${latest}<div>${items}</div><div class="footer">由 GitHub Actions 自动生成并发布</div></div></body></html>`;
 }
 
@@ -331,56 +307,49 @@ async function main(){
   const dateStr=beijingDateStr(now), rangeStr=`${beijingStr(cutoff).slice(0,16)} — ${beijingStr(now).slice(0,16)}`;
   console.log(`生成日期: ${dateStr}，区间: ${rangeStr}`);
 
-  const all=await fetchAll();
-  console.log(`合计 ${all.length} 条`);
-  const matched=[], extCand=[];
-  for(const a of all){
-    if(!isFresh(a,cutoff.getTime())) continue;
-    const hay=(a.title||'')+' '+(a.summary||'');
-    if(NOISE_KEYWORDS.some(k=>hay.includes(k))) continue; // 过滤噪音
-    if(isAccountMatch(a.source)) matched.push(a);
-    else if(EXT_KEYWORDS.some(k=>hay.includes(k))) extCand.push(a);
+  // CCF 网页采集（登录→抓列表→抓正文）
+  let enriched=[];
+  if(CCF_USER && CCF_PASS){
+    console.log('使用 CCF 网页源采集...');
+    enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
+  }else{
+    console.log('未配置 CCF_USERNAME/CCF_PASSWORD，无数据源');
   }
-  // 去重：同一标题只留一个
-  const seenTitle=new Set();
-  const dedup=(arr)=>arr.filter(a=>{const t=(a.title||'').slice(0,20); if(seenTitle.has(t))return false; seenTitle.add(t); return true;});
-  const ext=dedup(extCand.sort((x,y)=>String(y.datetime).localeCompare(String(x.datetime)))).slice(0,6);
-  const selected=[...dedup(matched), ...ext];
-  console.log(`选定 ${selected.length} 篇（指定 ${matched.length} + 延伸 ${ext.length}）`);
+  console.log(`采集完成，共 ${enriched.length} 篇`);
 
-  // 抓正文
-  const enriched=await enrichArticles(selected);
+  // 只选今天的新文章
+  const selected=enriched.filter(a=>isFresh(a,cutoff.getTime()));
+  console.log(`当日文章 ${selected.length} 篇`);
+
   try{ fs.writeFileSync(path.join(__dirname,'..','debug_last.json'), JSON.stringify(enriched,null,2),'utf-8'); }catch{}
 
   let data;
   if(LLM_API_KEY && selected.length>0){
     console.log('调用 DeepSeek 整合...');
     try{
-      const resp=await callLLM(buildLLMPrompt(enriched,dateStr,rangeStr));
+      const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
       data=safeParseJSON(resp);
       console.log('整合完成，要点 '+(data.highpoints||[]).length+' 条，板块 '+(data.sections||[]).length+' 个');
     }catch(e){
       console.error('LLM 失败，降级为标题列表: '+e.message);
-      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为推文列表。'}], sections:[{title:'推文列表',paragraphs:enriched.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。' };
+      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。' };
     }
   }else{
     console.log('未配置 LLM_API_KEY，生成简单列表版');
-    data={ highpoints:enriched.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'推文列表',paragraphs:enriched.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
+    data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
   fs.mkdirSync(SITE_DIR,{recursive:true});
-  const sources=enriched.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
+  const sources=selected.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
   fs.writeFileSync(path.join(SITE_DIR,`${dateStr}.html`), renderDaily(dateStr,rangeStr,data,sources),'utf-8');
   const briefings=fs.readdirSync(SITE_DIR).filter(f=>/^\d{4}-\d{2}-\d{2}\.html$/.test(f)).map(f=>({file:f,date:f.replace('.html','')})).sort((a,b)=>b.date.localeCompare(a.date));
   fs.writeFileSync(path.join(SITE_DIR,'index.html'), renderIndex(briefings),'utf-8');
   console.log(`完成，共 ${briefings.length} 期简报`);
 
-  // 输出推送摘要（供 notify.js 使用）
+  // 输出推送摘要
   try{
     fs.writeFileSync(path.join(__dirname,'..','notify.json'), JSON.stringify({
-      date: dateStr,
-      range: rangeStr,
-      sources: sources.length,
+      date: dateStr, range: rangeStr, sources: sources.length,
       degraded: !LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
       points: (data.highpoints||[]).map(h=>({tag:h.tag,text:h.text})).slice(0,5),
       sections: (data.sections||[]).map(s=>s.title),
