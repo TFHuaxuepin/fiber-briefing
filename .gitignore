@@ -3,3 +3,5 @@ debug_last.json
 notify.json
 site/
 *.log
+
+cmdkey_out.txt
