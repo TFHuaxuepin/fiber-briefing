@@ -6,7 +6,9 @@
  *
  *  1) 群机器人（自定义机器人 Webhook）—— 推到群里，可 @ 指定人
  *     DINGTALK_WEBHOOK      必填，可逗号分隔多个（同时推多个群）
- *     DINGTALK_SECRET       选填，机器人安全设置选「加签」时填
+ *     DINGTALK_SECRET       选填，机器人安全设置选「加签」时填。
+ *                           ⚠️ 不要填：安全设置选「自定义关键词」时留空（本项目当前采用此方式，
+ *                           关键词 =「化纤」，消息正文由 KEYWORD_GUARD 兜底保证含该词）。
  *     DINGTALK_AT_MOBILES   选填，要 @ 的手机号，逗号分隔
  *
  *  2) 企业机器人单聊 —— 直接私聊发给指定的人（需钉钉开放平台企业内部应用）
@@ -29,6 +31,14 @@ const ROBOT_CODE = (process.env.DINGTALK_ROBOT_CODE || '').trim();
 const USER_IDS = (process.env.DINGTALK_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const SITE_BASE = (process.env.SITE_BASE || '').replace(/\/$/, '');
 const DRY_RUN = process.argv.includes('--dry-run');
+
+// 机器人安全设置若为「自定义关键词」，消息正文必须包含该关键词，否则报 310000。
+// 本项目的关键词固定为「化纤」；这里做兜底拼接，避免日后改动文案时漏词导致静默失败。
+const KEYWORD = '化纤';
+function keywordGuard(text) {
+  if (!SECRET && !text.includes(KEYWORD)) return `${text}\n\n${KEYWORD}`;
+  return text;
+}
 
 // ===== 通用请求 =====
 function postJSON(url, obj, headers) {
@@ -93,7 +103,7 @@ function buildMessage(n) {
   // markdown 消息里 @某人，正文必须出现 @手机号
   if (AT_MOBILES.length) text += `\n${AT_MOBILES.map(m => '@' + m).join(' ')}\n`;
 
-  return { title, text };
+  return { title, text: keywordGuard(text) };
 }
 
 // 钉钉错误码 → 可操作的排查提示
