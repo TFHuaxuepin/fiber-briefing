@@ -8,3 +8,11 @@ cmdkey_out.txt
 
 _logs/
 pages_index.html
+
+# Local probes / CI logs / downloaded run artifacts (may contain credentials)
+_*.js
+_*.txt
+_*.zip
+_l*/
+last_run.txt
+test_parse.js
