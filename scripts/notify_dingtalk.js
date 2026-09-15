@@ -16,6 +16,10 @@
  *
  * 读取仓库根目录 notify.json（由 build_briefing.js 生成）。
  * 本地预览：node scripts/notify_dingtalk.js --dry-run
+ *
+ * 测试开关：SKIP_DINGTALK=1 时本脚本直接退出、不发任何消息。
+ *   用途：需要验证工作流其它环节、又不想打扰群里的同事时（手动触发可勾选 skip_dingtalk）。
+ *   线上定时任务不设该变量，正常推送。
  */
 const fs = require('fs');
 const path = require('path');
@@ -31,6 +35,8 @@ const ROBOT_CODE = (process.env.DINGTALK_ROBOT_CODE || '').trim();
 const USER_IDS = (process.env.DINGTALK_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const SITE_BASE = (process.env.SITE_BASE || '').replace(/\/$/, '');
 const DRY_RUN = process.argv.includes('--dry-run');
+// 测试运行开关：只要不是空/0/false 就跳过发送，避免测试打扰群里同事
+const SKIP_DINGTALK = /^(1|true|yes|on)$/i.test((process.env.SKIP_DINGTALK || '').trim());
 
 // 机器人安全设置若为「自定义关键词」，消息正文必须包含该关键词，否则报 310000。
 // 本项目的关键词固定为「化纤」；这里做兜底拼接，避免日后改动文案时漏词导致静默失败。
@@ -172,6 +178,10 @@ async function sendOto(token, title, text) {
 
 // ===== 主流程 =====
 async function main() {
+  if (SKIP_DINGTALK && !DRY_RUN) {
+    console.log('SKIP_DINGTALK 已开启，本次只构建/发布，不发送钉钉消息');
+    return;
+  }
   const p = path.join(__dirname, '..', 'notify.json');
   if (!fs.existsSync(p)) { console.error('notify.json 不存在，跳过推送'); return; }
   const n = JSON.parse(fs.readFileSync(p, 'utf-8'));
