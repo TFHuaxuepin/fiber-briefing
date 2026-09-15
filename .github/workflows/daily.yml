@@ -25,6 +25,13 @@ jobs:
       SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
       CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
       CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+      DINGTALK_AT_MOBILES: ${{ secrets.DINGTALK_AT_MOBILES }}
+      DINGTALK_APP_KEY: ${{ secrets.DINGTALK_APP_KEY }}
+      DINGTALK_APP_SECRET: ${{ secrets.DINGTALK_APP_SECRET }}
+      DINGTALK_ROBOT_CODE: ${{ secrets.DINGTALK_ROBOT_CODE }}
+      DINGTALK_USER_IDS: ${{ secrets.DINGTALK_USER_IDS }}
       SITE_BASE: https://tfhuaxuepin.github.io/fiber-briefing
     steps:
       - name: Checkout main
@@ -60,4 +67,8 @@ jobs:
 
       - name: WeChat push via ServerChan (微信推送)
         run: node scripts/notify.js
+        continue-on-error: true
+
+      - name: DingTalk push (钉钉推送)
+        run: node scripts/notify_dingtalk.js
         continue-on-error: true
