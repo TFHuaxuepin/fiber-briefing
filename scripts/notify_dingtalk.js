@@ -113,17 +113,30 @@ function hintFor(json) {
 }
 
 // ===== 通道 1：群机器人 Webhook =====
+function withSign(webhook, secret) {
+  const ts = Date.now();
+  const sign = crypto.createHmac('sha256', secret).update(`${ts}\n${secret}`).digest('base64');
+  return webhook + (webhook.includes('?') ? '&' : '?') + `timestamp=${ts}&sign=${encodeURIComponent(sign)}`;
+}
+
 async function sendGroup(webhook, payload) {
-  let url = webhook;
-  if (SECRET) {
-    const ts = Date.now();
-    const sign = crypto.createHmac('sha256', SECRET).update(`${ts}\n${SECRET}`).digest('base64');
-    url += (url.includes('?') ? '&' : '?') + `timestamp=${ts}&sign=${encodeURIComponent(sign)}`;
+  // 先按配置发送；若因签名校验失败，自动退回「不带加签」再试一次
+  // （覆盖：机器人安全设置其实是「自定义关键词」、或密钥与 Webhook 不配对的情况）
+  const attempts = SECRET ? [{ mode: '加签', url: withSign(webhook, SECRET) }, { mode: '无加签', url: webhook }] : [{ mode: '无加签', url: webhook }];
+
+  let last = null;
+  for (const a of attempts) {
+    const r = await postJSON(a.url, payload);
+    if (r.json && r.json.errcode === 0) {
+      if (a.mode === '无加签' && SECRET) console.log('  (已自动退回「无加签」模式发送成功 —— 建议删除 DINGTALK_SECRET)');
+      return { ok: true };
+    }
+    last = { status: r.status, raw: r.raw, json: r.json, mode: a.mode };
+    // 非签名类错误无需换模式重试
+    if (!(r.json && r.json.errcode === 310000)) break;
   }
-  const r = await postJSON(url, payload);
-  if (r.json && r.json.errcode === 0) return { ok: true };
-  const hint = hintFor(r.json);
-  return { ok: false, msg: `${r.status} ${r.raw.slice(0, 300)}${hint ? '\n  ' + hint : ''}` };
+  const hint = hintFor(last.json);
+  return { ok: false, msg: `[${last.mode}] ${last.status} ${last.raw.slice(0, 300)}${hint ? '\n  ' + hint : ''}` };
 }
 
 // ===== 通道 2：企业机器人单聊 =====
