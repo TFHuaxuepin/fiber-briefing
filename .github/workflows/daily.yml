@@ -17,15 +17,19 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      # 单次请求超时 5 分钟、最多 2 轮，避免网关抖动直接降级为标题列表（最坏 10 分钟）
+      LLM_TIMEOUT_MS: '300000'
+      LLM_MAX_ROUNDS: '2'
       SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
       CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
       CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
       DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      # 留空即走「自定义关键词」模式；若机器人改为「加签」安全设置，补回该 Secret 即可
       DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
       DINGTALK_AT_MOBILES: ${{ secrets.DINGTALK_AT_MOBILES }}
       DINGTALK_APP_KEY: ${{ secrets.DINGTALK_APP_KEY }}
