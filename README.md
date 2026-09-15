@@ -20,8 +20,28 @@
 | `LLM_BASE_URL` | `https://token.chinaunicomglobal.com` | 选填，默认即此值 |
 | `LLM_MODEL` | `deepseek-v4-pro` | 选填，默认即此值 |
 | `SERVERCHAN_KEY` | Server酱 SendKey | 选填，配置后推送微信通知 |
+| `DINGTALK_WEBHOOK` | 钉钉群机器人 Webhook | 选填，配置后推送钉钉群 |
+| `DINGTALK_SECRET` | 钉钉机器人加签密钥 | 选填，安全设置选「加签」时必填 |
+| `DINGTALK_AT_MOBILES` | 要 @ 的手机号，逗号分隔 | 选填 |
+| `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET` / `DINGTALK_ROBOT_CODE` / `DINGTALK_USER_IDS` | 企业内部应用机器人凭据 | 选填，用于**私聊推给指定的人** |
 
 不配置 `LLM_API_KEY` 时脚本会降级为标题列表，不会报错。
+
+## 钉钉推送
+
+简报生成后，`scripts/notify_dingtalk.js` 读取 `notify.json`，把「今日要点 + 简报链接」以 markdown 卡片推送到钉钉。两种通道按配置自动启用：
+
+**通道 1 · 群机器人**（推荐，5 分钟搞定）
+钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义 → 安全设置选「加签」→ 复制 Webhook 与加签密钥，分别存入 `DINGTALK_WEBHOOK` 和 `DINGTALK_SECRET`。想 @ 谁就把手机号填进 `DINGTALK_AT_MOBILES`。
+
+**通道 2 · 私聊指定人**（需企业内部应用）
+钉钉开放平台 → 创建企业内部应用 → 添加「机器人」→ 发布后拿到 AppKey / AppSecret / RobotCode，配上接收人的 userId（`DINGTALK_USER_IDS`，通讯录里查）。
+
+本地预览推送文案（不实际发送）：
+
+```bash
+node scripts/notify_dingtalk.js --dry-run
+```
 
 ## 启用 GitHub Pages
 
@@ -47,6 +67,7 @@ scripts/
   ccf.js              CCF 采集模块（登录 / 列表 / 正文）
   build_briefing.js   主流程（采集 → 整合 → 渲染 HTML）
   notify.js           Server酱微信推送
+  notify_dingtalk.js  钉钉推送（群机器人 / 企业机器人单聊）
 .github/workflows/
   daily.yml           定时任务定义
 ```
