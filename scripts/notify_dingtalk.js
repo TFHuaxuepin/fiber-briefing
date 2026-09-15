@@ -96,6 +96,22 @@ function buildMessage(n) {
   return { title, text };
 }
 
+// 钉钉错误码 → 可操作的排查提示
+function hintFor(json) {
+  if (!json) return '';
+  const code = json.errcode;
+  const msg = String(json.errmsg || '');
+  if (code === 310000) {
+    if (msg.includes('签名')) return '→ 加签密钥（DINGTALK_SECRET）与该 Webhook 不配对。请重新复制【同一个机器人】的加签密钥；或把机器人安全设置改为「自定义关键词」（关键词填「化纤」），然后删掉 DINGTALK_SECRET。';
+    if (msg.includes('关键词')) return '→ 消息未包含机器人配置的关键词，请把关键词设为「化纤」或「简报」。';
+    return '→ 安全设置校验未通过：检查加签密钥是否正确，或改用自定义关键词。';
+  }
+  if (code === 300001) return '→ Webhook 地址无效或已失效，请重新复制完整的 access_token。';
+  if (code === 130101 || code === 400013) return '→ 发送过于频繁，钉钉限制每机器人每分钟 20 条。';
+  if (code === 310001) return '→ 机器人已被停用或移出群，请在群内重新添加。';
+  return '';
+}
+
 // ===== 通道 1：群机器人 Webhook =====
 async function sendGroup(webhook, payload) {
   let url = webhook;
@@ -106,7 +122,8 @@ async function sendGroup(webhook, payload) {
   }
   const r = await postJSON(url, payload);
   if (r.json && r.json.errcode === 0) return { ok: true };
-  return { ok: false, msg: `${r.status} ${r.raw.slice(0, 200)}` };
+  const hint = hintFor(r.json);
+  return { ok: false, msg: `${r.status} ${r.raw.slice(0, 300)}${hint ? '\n  ' + hint : ''}` };
 }
 
 // ===== 通道 2：企业机器人单聊 =====
