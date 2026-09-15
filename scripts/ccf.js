@@ -9,10 +9,14 @@ const iconv = require('iconv-lite');
 const querystring = require('querystring');
 
 // 栏目配置
-// 经实测：list-110000.shtml 是"全部"列表（约28篇），会同时返回快讯/评论/要闻等各栏目文章。
-// 为避免重复请求触发 429 限流，只保留一个主列表，用文章 URL 里的 colId 区分栏目。
+// 每个栏目都是独立列表页（list-<id>.shtml），需要单独请求。
+// windowHours：该栏目的时间回溯窗口。快讯为日频用 24h；日报/市场速递内容更结构化，但
+//   周末不更新、且列表页不给出精确时分（默认 09:00），故回溯 72h 以覆盖周五→周一。
+// maxArticles：该栏目最多抓多少篇正文，用于控制请求量与 429 风险。
 const COLUMNS = [
-  { id: '110000', name: 'CCF快讯', priority: 1 },
+  { id: '110000', name: 'CCF快讯',   windowHours: 24, maxArticles: 40 },
+  { id: '140000', name: 'CCF日报',   windowHours: 72, maxArticles: 24 },
+  { id: '340000', name: '市场速递', windowHours: 72, maxArticles: 5 },
 ];
 
 const BASE = 'https://huarui.ccf.com.cn';
@@ -255,47 +259,52 @@ function cleanText(html) {
 
 // ===== 主入口 =====
 
+// 北京时间（用 UTC getter 读即得北京时间墙上钟）
+function beijingNow() { return new Date(Date.now() + 8 * 3600 * 1000); }
+function bjDateStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`; }
+
 async function fetchCCFArticles(username, password) {
   const cookies = await login(username, password);
+  const now = beijingNow();
   const all = [];
   const seen = new Set();
 
-  // 只抓一个主列表（所有栏目合并），避免多页重复请求触发限流
-  const col = COLUMNS[0];
-  console.log(`  [CCF] 采集 ${col.name}...`);
-  await sleep(2000 + Math.random() * 2000);
-  const articles = await fetchList(cookies, col.id, col.name);
-  console.log(`    -> ${articles.length} 篇`);
-  for (const a of articles) {
-    const k = a.url;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    all.push(a);
+  // ① 逐栏目抓列表，按各栏目的时间窗过滤后限量取用
+  for (const col of COLUMNS) {
+    console.log(`  [CCF] 采集 ${col.name}（list-${col.id}，回溯 ${col.windowHours}h）...`);
+    await sleep(2000 + Math.random() * 2000);
+    let arts = [];
+    try { arts = await fetchList(cookies, col.id, col.name); }
+    catch (e) { console.error(`    [CCF] ${col.name} 列表失败: ${e.message}`); }
+
+    const from = bjDateStr(new Date(now.getTime() - col.windowHours * 3600 * 1000));
+    const to = bjDateStr(now);
+    const inWindow = arts.filter(a => { const d = (a.datetime || '').slice(0, 10); return d >= from && d <= to; });
+    let picked = inWindow.slice(0, col.maxArticles);
+    console.log(`    -> 列表 ${arts.length} 篇，窗口内 ${inWindow.length} 篇，采用 ${picked.length} 篇`);
+
+    for (const a of picked) {
+      if (seen.has(a.url)) continue;
+      seen.add(a.url);
+      a.windowHours = col.windowHours;   // 供下游做时间窗判断
+      all.push(a);
+    }
   }
 
   console.log(`[CCF] 合计 ${all.length} 篇待采集正文`);
 
-  // 只抓当天的文章正文（避免过多请求）
-  const today = new Date(Date.now() + 8 * 3600000);
-  const cutoff = new Date(today.getFullYear(), today.getMonth(), today.getDate()); // 今天 00:00
-
+  // ② 逐篇抓正文（限流保护：每篇间隔 1.5~2.5s）
   const enriched = [];
   for (let i = 0; i < all.length; i++) {
     const a = all[i];
-    const dtStr = a.datetime.slice(0, 10);
-    const shouldFetch = dtStr >= cutoff.toISOString().slice(0, 10);
-    if (shouldFetch) {
-      await sleep(1500 + Math.random() * 1000); // 增加间隔防429
-      a.content = await fetchContent(cookies, a.url);
-      if (a.content) console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0,30)} (${a.content.length}字)`);
-    } else {
-      a.content = '';
-    }
+    await sleep(1500 + Math.random() * 1000);
+    a.content = await fetchContent(cookies, a.url);
+    if (a.content) console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0, 30)} (${a.content.length}字)`);
     enriched.push(a);
-    if ((i + 1) % 5 === 0 && shouldFetch) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}`);
+    if ((i + 1) % 5 === 0) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}`);
   }
 
   return enriched;
 }
 
-module.exports = { fetchCCFArticles, login, fetchCCFArticles };
+module.exports = { fetchCCFArticles, login, fetchCCFArticles, COLUMNS };
