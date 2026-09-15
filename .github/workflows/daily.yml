@@ -5,6 +5,11 @@ on:
     # UTC 01:00 = 北京时间 09:00，每天执行
     - cron: '0 1 * * *'
   workflow_dispatch:
+    inputs:
+      skip_dingtalk:
+        description: '跳过钉钉推送（测试用，不打扰群成员）'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -37,6 +42,8 @@ jobs:
       DINGTALK_ROBOT_CODE: ${{ secrets.DINGTALK_ROBOT_CODE }}
       DINGTALK_USER_IDS: ${{ secrets.DINGTALK_USER_IDS }}
       SITE_BASE: https://tfhuaxuepin.github.io/fiber-briefing
+      # 手动触发时若勾选 skip_dingtalk，则只构建发布、不发钉钉（定时任务恒为空＝正常推送）
+      SKIP_DINGTALK: ${{ inputs.skip_dingtalk && '1' || '' }}
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
