@@ -146,6 +146,24 @@ async function login(username, password) {
         return cookies;
       }
 
+      // 兼容分支：某些网络环境下服务端不下发 uid cookie（前置 CDN/WAF 行为差异），
+      // 但会话其实已经登录。判据：响应体是「登录后」页面（含"欢迎您"，且不含"请登录/免费注册"）。
+      // 仅接受这一次，真正的有效性由后续正文抓取来验证（全空则报错，不会产出空简报）。
+      let pageText = '';
+      try {
+        pageText = decodeGBK(s2.body, s2.headers)
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/\s+/g, ' ');
+      } catch (e) { /* 解析失败则按失败处理 */ }
+      if (/欢迎您/.test(pageText) && !/请登录|免费注册/.test(pageText)) {
+        console.log(`[CCF] 已登录（响应为「登录后」页面，但未下发 uid cookie；cookie=${cookies.slice(0, 60)}）`);
+        loggedInCookies = cookies;
+        return cookies;
+      }
+
       // 失败：记录诊断信息，便于在 CI 日志里定位原因
       let diag = '';
       try {
@@ -330,14 +348,22 @@ async function fetchCCFArticles(username, password) {
 
   // ② 逐篇抓正文（限流保护：每篇间隔 1.5~2.5s）
   const enriched = [];
+  let contentOk = 0;
   for (let i = 0; i < all.length; i++) {
     const a = all[i];
     await sleep(1500 + Math.random() * 1000);
     a.content = await fetchContent(cookies, a.url);
-    if (a.content) console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0, 30)} (${a.content.length}字)`);
+    if (a.content) { contentOk++; console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0, 30)} (${a.content.length}字)`); }
     enriched.push(a);
-    if ((i + 1) % 5 === 0) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}`);
+    if ((i + 1) % 5 === 0) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}（成功 ${contentOk}）`);
   }
+
+  // 护栏：有文章却一篇正文都拿不到，说明会话其实未登录（或被风控），
+  // 直接报错退出，避免上游拿着空数据生成一份空简报。
+  if (all.length > 0 && contentOk === 0) {
+    throw new Error(`CCF 正文全部抓取失败（共 ${all.length} 篇，0 篇有内容）——会话很可能未真正登录，或被目标站风控拦截`);
+  }
+  console.log(`[CCF] 正文抓取完成：${contentOk}/${all.length} 篇有内容`);
 
   return enriched;
 }
