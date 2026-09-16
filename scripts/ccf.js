@@ -147,19 +147,10 @@ async function login(username, password) {
       }
 
       // 兼容分支：某些网络环境下服务端不下发 uid cookie（前置 CDN/WAF 行为差异），
-      // 但会话其实已经登录。判据：响应体是「登录后」页面（含"欢迎您"，且不含"请登录/免费注册"）。
-      // 仅接受这一次，真正的有效性由后续正文抓取来验证（全空则报错，不会产出空简报）。
-      let pageText = '';
-      try {
-        pageText = decodeGBK(s2.body, s2.headers)
-          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/&nbsp;/g, ' ')
-          .replace(/\s+/g, ' ');
-      } catch (e) { /* 解析失败则按失败处理 */ }
-      if (/欢迎您/.test(pageText) && !/请登录|免费注册/.test(pageText)) {
-        console.log(`[CCF] 已登录（响应为「登录后」页面，但未下发 uid cookie；cookie=${cookies.slice(0, 60)}）`);
+      // 但只要 POST 返回 200，就先把会话当作「可能已登录」继续往下走，
+      // 真正的有效性由正文抓取来判定（首篇正文为空即立刻报错，不会产出空简报）。
+      if (s2.status === 200) {
+        console.log(`[CCF] 未下发 uid cookie，按 HTTP 200 继续（cookie=${cookies.slice(0, 60)}）；登录状态将由正文抓取验证`);
         loggedInCookies = cookies;
         return cookies;
       }
@@ -355,6 +346,10 @@ async function fetchCCFArticles(username, password) {
     a.content = await fetchContent(cookies, a.url);
     if (a.content) { contentOk++; console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0, 30)} (${a.content.length}字)`); }
     enriched.push(a);
+    // 快速失败：首篇正文就为空 → 会话未真正登录（或被风控），立即报错，省下几十次无用请求
+    if (i === 0 && !a.content) {
+      throw new Error(`CCF 首篇正文为空（${a.url}）——会话未真正登录，或被目标站风控拦截`);
+    }
     if ((i + 1) % 5 === 0) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}（成功 ${contentOk}）`);
   }
 
