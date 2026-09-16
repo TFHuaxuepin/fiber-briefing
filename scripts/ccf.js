@@ -100,47 +100,70 @@ function decodeGBK(buf, headers) {
 async function login(username, password) {
   if (!username || !password) throw new Error('需要 CCF_USERNAME 和 CCF_PASSWORD 环境变量');
   console.log('[CCF] 登录...');
-  let cookies = '';
 
-  // Step1: 获取 session
-  const s1 = await request({url: `${BASE}/`});
-  cookies = mergeCookies(cookies, s1.headers['set-cookie']);
+  // 登录偶发失败（服务端抖动 / 风控），重试 2 轮
+  const MAX_ATTEMPTS = 3;
+  let lastDiag = '';
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let cookies = '';
+    try {
+      // Step1: 获取 session
+      const s1 = await request({url: `${BASE}/`});
+      cookies = mergeCookies(cookies, s1.headers['set-cookie']);
 
-  // Step2: POST 登录
-  const body = querystring.stringify({
-    custlogin: '1',
-    action: 'login',
-    url: '/',
-    lng: '-1',
-    lat: '-1',
-    s: '',
-    username,
-    password,
-    savecookie: '1',
-    'imageField.x': '12',
-    'imageField.y': '8',
-  });
-  const s2 = await request({
-    url: `${BASE}/member/member.php`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Cookie': cookies,
-      'Origin': BASE,
-      'Referer': `${BASE}/`,
-    },
-    body,
-  });
-  cookies = mergeCookies(cookies, s2.headers['set-cookie']);
+      // Step2: POST 登录
+      const body = querystring.stringify({
+        custlogin: '1',
+        action: 'login',
+        url: '/',
+        lng: '-1',
+        lat: '-1',
+        s: '',
+        username,
+        password,
+        savecookie: '1',
+        'imageField.x': '12',
+        'imageField.y': '8',
+      });
+      const s2 = await request({
+        url: `${BASE}/member/member.php`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Cookie': cookies,
+          'Origin': BASE,
+          'Referer': `${BASE}/`,
+        },
+        body,
+      });
+      cookies = mergeCookies(cookies, s2.headers['set-cookie']);
 
-  // 验证登录：检查是否有 uid cookie（非 0 值表示登录成功）
-  const uidMatch = cookies.match(/uid=([^;]+)/);
-  if (!uidMatch || uidMatch[1] === '0' || uidMatch[1] === '0%3D' || uidMatch[1].length < 10) {
-    throw new Error(`CCF 登录失败: 未获取到有效 uid cookie，请检查账号密码。cookie=${cookies.slice(0, 80)}`);
+      // 验证登录：检查是否有 uid cookie（非 0 值表示登录成功）
+      const uidMatch = cookies.match(/uid=([^;]+)/);
+      if (uidMatch && uidMatch[1] !== '0' && uidMatch[1] !== '0%3D' && uidMatch[1].length >= 10) {
+        console.log(attempt > 1 ? `[CCF] 登录成功（第 ${attempt} 次尝试）` : '[CCF] 登录成功');
+        loggedInCookies = cookies;
+        return cookies;
+      }
+
+      // 失败：记录诊断信息，便于在 CI 日志里定位原因
+      let snippet = '';
+      try {
+        snippet = decodeGBK(s2.body, s2.headers).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/\s+/g, ' ').slice(0, 300);
+      } catch (e) { snippet = '(解析响应失败)'; }
+      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 200)} | 首页set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 120)} | body前300字=${snippet}`;
+      console.error(`[CCF] 登录未拿到 uid cookie（${lastDiag}）`);
+    } catch (e) {
+      lastDiag = `第 ${attempt} 次：请求异常 ${e.message}`;
+      console.error(`[CCF] 登录请求异常（${lastDiag}）`);
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      const wait = 4000 * attempt;
+      console.log(`[CCF] ${Math.round(wait / 1000)}s 后重试登录 (${attempt + 1}/${MAX_ATTEMPTS})`);
+      await sleep(wait);
+    }
   }
-  console.log('[CCF] 登录成功');
-  loggedInCookies = cookies;
-  return cookies;
+  throw new Error(`CCF 登录失败（已重试 ${MAX_ATTEMPTS} 轮）：${lastDiag}`);
 }
 
 // ===== 列表页抓取 =====
