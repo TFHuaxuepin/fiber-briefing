@@ -147,11 +147,23 @@ async function login(username, password) {
       }
 
       // 失败：记录诊断信息，便于在 CI 日志里定位原因
-      let snippet = '';
+      let diag = '';
       try {
-        snippet = decodeGBK(s2.body, s2.headers).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/\s+/g, ' ').slice(0, 300);
-      } catch (e) { snippet = '(解析响应失败)'; }
-      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 200)} | 首页set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 120)} | body前300字=${snippet}`;
+        const raw = decodeGBK(s2.body, s2.headers);
+        const text = raw
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        // 优先抽取与失败有关的片段
+        const kw = text.match(/.{0,60}(密码|验证码|错误|失败|不正确|锁定|冻结|异地|频繁|限制|验证).{0,80}/);
+        diag = `可见文本=${text.slice(0, 400)}`
+          + (kw ? ` || 关键提示=${kw[0]}` : '')
+          + ` || body长度=${raw.length}`;
+      } catch (e) { diag = `(解析响应失败 ${e.message})`; }
+      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | location=${s2.headers.location || '(无)'} | POST set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 160)} | 首页 HTTP ${s1.status} set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 160)} | ${diag}`;
       console.error(`[CCF] 登录未拿到 uid cookie（${lastDiag}）`);
     } catch (e) {
       lastDiag = `第 ${attempt} 次：请求异常 ${e.message}`;
