@@ -33,6 +33,8 @@ jobs:
       SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
       CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
       CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
+      # 选填逃生通道：账号密码登录被目标站风控拦截时，临时填浏览器里已登录的 Cookie 串顶替
+      CCF_COOKIE: ${{ secrets.CCF_COOKIE }}
       DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
       # 留空即走「自定义关键词」模式；若机器人改为「加签」安全设置，补回该 Secret 即可
       DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
@@ -83,3 +85,12 @@ jobs:
       - name: DingTalk push (钉钉推送)
         run: node scripts/notify_dingtalk.js
         continue-on-error: true
+
+      # 失败告警：前面任一步骤失败时推一条微信，避免「早上没收到简报却没人知道」
+      - name: Failure alert (失败告警)
+        if: failure()
+        run: node scripts/notify_failure.js
+        continue-on-error: true
+        env:
+          FAIL_STEP: ${{ github.job }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
