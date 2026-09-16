@@ -98,6 +98,14 @@ function decodeGBK(buf, headers) {
 // ===== 登录 =====
 
 async function login(username, password) {
+  // 逃生通道：CCF_COOKIE 直接提供已登录的 Cookie 串（形如 "PHPSESSID=...; uid=...; values=...; identity=..."），
+  // 用于账号密码登录被目标站风控拦截时临时顶替。注意 PHPSESSID 服务端会话会过期，属临时方案。
+  const manual = (process.env.CCF_COOKIE || '').trim();
+  if (manual) {
+    console.log('[CCF] 使用人工提供的 CCF_COOKIE（跳过账号密码登录）');
+    loggedInCookies = manual;
+    return manual;
+  }
   if (!username || !password) throw new Error('需要 CCF_USERNAME 和 CCF_PASSWORD 环境变量');
   console.log('[CCF] 登录...');
 
@@ -146,14 +154,9 @@ async function login(username, password) {
         return cookies;
       }
 
-      // 兼容分支：某些网络环境下服务端不下发 uid cookie（前置 CDN/WAF 行为差异），
-      // 但只要 POST 返回 200，就先把会话当作「可能已登录」继续往下走，
-      // 真正的有效性由正文抓取来判定（首篇正文为空即立刻报错，不会产出空简报）。
-      if (s2.status === 200) {
-        console.log(`[CCF] 未下发 uid cookie，按 HTTP 200 继续（cookie=${cookies.slice(0, 60)}）；登录状态将由正文抓取验证`);
-        loggedInCookies = cookies;
-        return cookies;
-      }
+      // 说明：uid cookie 是登录成功的**必要**判据。曾观察到「响应页面看似已登录、但没有 uid」
+      // 的情况，实测这种会话抓到的正文其实是「会员可见」的拦截页 —— 所以这里必须严格。
+      // 拦截页由 fetchContent 的 gate 检测兜底（双保险），避免产出只有标题的空简报。
 
       // 失败：记录诊断信息，便于在 CI 日志里定位原因
       let diag = '';
@@ -277,15 +280,25 @@ async function fetchContent(cookies, url) {
   if (ncIdx >= 0) {
     const inner = extractBalancedDiv(html, ncIdx);
     const text = cleanText(inner);
-    if (text.length > 0) return text;
+    if (text.length > 0) return isGateText(text) ? '' : text;
   }
   // fallback: 非贪婪匹配
   const ncMatch = html.match(/<div[^>]*id=["']?newscontent["']?[^>]*>([\s\S]*?)<\/div>/i);
-  if (ncMatch) return cleanText(ncMatch[1]);
+  if (ncMatch) { const t = cleanText(ncMatch[1]); return isGateText(t) ? '' : t; }
   // 再 fallback: newsviewtext 容器
   const nvMatch = html.match(/<td[^>]*class=["'][^"']*newsviewtext[^"']*["'][^>]*>([\s\S]*?)<\/td>/i);
-  if (nvMatch) return cleanText(nvMatch[1]);
+  if (nvMatch) { const t = cleanText(nvMatch[1]); return isGateText(t) ? '' : t; }
   return '';
+}
+
+// 「会员可见 / 请登录」拦截页识别（非登录态下正文区返回的就是这类文案）。
+// 命中即视为「无正文」，避免把拦截页当正文送去整合，产出只有标题的空简报。
+function isGateText(text) {
+  if (!text) return true;
+  if (/请登录或注册会员|只对正式会员和试用会员开放|会员登录|登录名\s*密\s*码/.test(text)) return true;
+  // 极短且只含「CCF会员」之类提示
+  if (text.length < 40 && /CCF\s*会员|会员可见|请登录/.test(text)) return true;
+  return false;
 }
 
 function cleanText(html) {
