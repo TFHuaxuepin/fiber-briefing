@@ -282,13 +282,17 @@ async function callLLM(prompt){
               console.log(`  (第${round}轮返回不完整: ${q.reason}，${content.length} 字符 → 换下一个尝试)`);
               continue;
             }
-            lastErr='200 但内容为空'; continue;
+            const rc=(data.choices?.[0]?.message?.reasoning_content||'').length;
+            lastErr=rc?`200 内容为空(reasoning ${rc} 字，疑似推理超限)`:'200 但内容为空';
+            console.log(`  (第${round}轮 ${lastErr})`); continue;
           }
           lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
           console.log(`  (HTTP ${r.status}: ${model}/${jsonMode?'json':'text'} @ ${url.replace(/^https?:\/\//,'')})`);
           if(r.status===404){ deadUrls.add(url); break; }      // 端点不存在 → 本轮起跳过该端点
-          if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ deadModels.add(model); break; }
-          if(r.status===401||r.status===403){ deadModels.add(model); break; } // 鉴权/模型问题 → 换模型
+          if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ break; }
+          // 401/403 不再把模型永久拉黑（2026-09-17：网关偶发对可用模型返回 401 Model is disabled，
+          // 数分钟后同一模型又恢复正常；拉黑会导致后续轮次无模型可用）。轮数上限已控制总耗时。
+          if(r.status===401||r.status===403){ continue; }
         }
       }
     }
