@@ -20,6 +20,9 @@ try { cheerio = require(path.join(NODE_MODULES, 'cheerio')); } catch { try { che
 const LLM_API_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || '';
 const LLM_BASE = process.env.LLM_BASE_URL || 'https://token.chinaunicomglobal.com';
 const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-v4-pro';
+// 长文本生成在部分网关需要数分钟，超时给足；单轮失败按轮重试，避免偶发抖动直接降级
+const LLM_TIMEOUT = Number(process.env.LLM_TIMEOUT_MS || 300000);
+const LLM_MAX_ROUNDS = Number(process.env.LLM_MAX_ROUNDS || 3);
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 // ===== 工具 =====
@@ -28,8 +31,34 @@ function nowBeijing() { return new Date(Date.now() + 8 * 60 * 60 * 1000); }
 function beijingStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`; }
 function beijingDateStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}`; }
 function parseBeijing(datetime) { const m = datetime.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/); if (!m) return null; return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]) - 8*60*60*1000); }
-function isFresh(a, cutoff){ const dt = parseBeijing(a.datetime||''); return dt!==null && dt.getTime()>=cutoff; }
+// 时间窗判断：不同栏目回溯窗口不同（快讯 24h，日报/市场速递 72h 以覆盖周末），
+// 统一用「北京墙上钟字符串」比较，避免时区换算误差把日报整批滤掉。
+function windowStart(now, hours){ return beijingStr(new Date(now.getTime() - hours*60*60*1000)).slice(0,16); }
+function isFresh(a, now){
+  const d=String(a.datetime||'').slice(0,16);
+  if(!d) return false;
+  const start=windowStart(now, a.windowHours||24);
+  const end=beijingStr(now).slice(0,16);
+  return d>=start && d<=end;
+}
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+// 去除大模型可能夹带的 HTML 标签
+function stripTags(s){ return String(s||'').replace(/<[^>]*>/g,'').replace(/&nbsp;/g,' ').trim(); }
+// 对已转义的文本中的涨跌数字着色（+红色 / -绿色，遵循 A 股习惯）
+function colorize(escaped){
+  return String(escaped||'')
+    .replace(/\+\s?\d[\d,]*(?:\.\d+)?\s?%?/g, m=>`<span class="up">${m}</span>`)
+    .replace(/(?<![\d\w])-\s?\d[\d,]*(?:\.\d+)?\s?%?/g, m=>`<span class="down">${m}</span>`);
+}
+// 标签文案映射
+function tagLabel(tag){
+  const t=String(tag||'').trim();
+  const l=t.toLowerCase();
+  if(l==='up'||t==='涨') return '涨';
+  if(l==='down'||t==='跌') return '跌';
+  if(l==='stable'||t==='稳'||t==='稳定'||t==='持平') return '稳';
+  return t||'资讯';
+}
 
 function decompress(buffer, encoding){ if(!encoding) return buffer; const e=String(encoding).toLowerCase(); try{ if(e.includes('gzip')) return zlib.gunzipSync(buffer); if(e.includes('deflate')) return zlib.inflateSync(buffer); if(e.includes('br')) return zlib.brotliDecompressSync(buffer); }catch{} return buffer; }
 function request(url, headers, timeoutMs=20000){
@@ -193,7 +222,7 @@ async function enrichArticles(list){
 }
 
 // ===== 大模型整合 =====
-function llmCandidates(){
+function llmEndpoints(){
   const base=LLM_BASE.replace(/\/+$/,'');
   // 若 base 已含具体端点，直接用
   if(/\/chat\/completions$/.test(base)) return [base];
@@ -202,6 +231,10 @@ function llmCandidates(){
   // 否则先试 /v1/chat/completions（多数网关），再回退 /chat/completions（DeepSeek 原生）
   return [base+'/v1/chat/completions', base+'/chat/completions'];
 }
+// 模型候选：默认模型优先，其次环境变量指定的模型（去重）
+function llmModels(){
+  return [...new Set(['deepseek-v4-pro', LLM_MODEL].filter(Boolean))];
+}
 function postJSON(url, body){
   return new Promise((resolve,reject)=>{
     const u=new URL(url);
@@ -209,60 +242,181 @@ function postJSON(url, body){
     const req=lib.request({hostname:u.hostname,protocol:u.protocol,path:u.pathname+(u.search||''),method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${LLM_API_KEY}`,'Content-Length':Buffer.byteLength(body)}},res=>{
       const chunks=[]; res.on('data',c=>chunks.push(c)); res.on('end',()=>resolve({status:res.statusCode,raw:Buffer.concat(chunks).toString('utf-8')}));
     });
-    req.on('error',reject); req.setTimeout(120000,()=>{req.destroy();reject(new Error('LLM timeout'));}); req.write(body); req.end();
+    req.on('error',reject); req.setTimeout(LLM_TIMEOUT,()=>{req.destroy();reject(new Error('LLM timeout'));}); req.write(body); req.end();
   });
 }
 async function callLLM(prompt){
-  const mkBody=(useJsonMode)=>JSON.stringify(Object.assign(
-    { model:LLM_MODEL, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:5000 },
-    useJsonMode?{response_format:{type:'json_object'}}:{}
-  ));
-  const urls=llmCandidates();
+  const urls=llmEndpoints(), models=llmModels();
+  const deadUrls=new Set();
+  const deadModels=new Set();
   let lastErr='';
-  for(const url of urls){
-    for(const useJsonMode of [true,false]){
-      let result;
-      try{ result=await postJSON(url, mkBody(useJsonMode)); }
-      catch(e){ lastErr=`${e.message} @ ${url}`; console.error(`  请求失败: ${e.message}`); continue; }
-      console.log(`LLM 状态: ${result.status} (${url.replace(/^https?:\/\//,'')}${useJsonMode?'':', 无json_mode'})`);
-      if(result.status===404){ lastErr=`404 @ ${url}`; break; } // 换下一个候选路径
-      if(result.status===400 && useJsonMode){ lastErr=`400 @ ${url}`; continue; } // 可能不支持 json_object，去掉后重试
-      if(result.status!==200) throw new Error(`LLM 调用失败(${result.status}): `+result.raw.slice(0,300));
-      const data=JSON.parse(result.raw);
-      return data.choices?.[0]?.message?.content||'';
+  // 输出预算自适应：deepseek-v4-pro 是推理模型，reasoning 与正文共用 max_tokens。
+  // 推理超限（正文为空但 reasoning 很长）或输出截断时自动倍增预算重试（2026-09-17 事故：
+  // 固定 8000 被推理全部吃掉，正文 0 字）。可用 LLM_MAX_TOKENS 覆盖初始值。
+  let maxTok=Number(process.env.LLM_MAX_TOKENS||8000);
+  console.log(`  提示词 ${prompt.length} 字符，max_tokens=${maxTok}，超时阈值 ${Math.round(LLM_TIMEOUT/1000)}s`);
+  // 多轮重试：网关长文本生成偶发超时/断连，单轮失败不代表端点不可用，
+  // 只有 404 才判定端点失效（deadUrls），鉴权/模型问题才换模型（deadModels）。
+  for(let round=1; round<=LLM_MAX_ROUNDS; round++){
+    for(const model of models){
+      if(deadModels.has(model)) continue;
+      for(const url of urls){
+        if(deadUrls.has(url)) continue;
+        for(const jsonMode of [true,false]){
+          const body=JSON.stringify(Object.assign(
+            { model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:maxTok },
+            jsonMode?{response_format:{type:'json_object'}}:{}
+          ));
+          let r;
+          try{ r=await postJSON(url, body); }
+          catch(e){ lastErr=`${e.message} @ ${url}`; console.log(`  (第${round}轮失败: ${model}/${jsonMode?'json':'text'} → ${e.message})`); continue; }
+          if(r.status===200){
+            let data; try{ data=JSON.parse(r.raw); }catch(e){ lastErr='响应非JSON'; continue; }
+            const choice=data.choices?.[0]||{};
+            const content=choice.message?.content||'';
+            const finish=choice.finish_reason||'';
+            if(content){
+              // 完整性门槛：残缺输出（截断/模型偷懒只给要点）不能当成功接受，
+              // 否则会生成「只有要点、板块空壳」的降级简报（2026-09-17 事故）。
+              // 判据：可解析为 JSON + 要点≥3 + 板块≥2（与渲染兜底阈值一致）。
+              const q=qualityCheck(content);
+              if(q.ok){
+                console.log(`LLM 成功: model=${model}, url=${url.replace(/^https?:\/\//,'')}, json=${jsonMode}, max_tokens=${maxTok}, 返回 ${content.length} 字符`);
+                return content;
+              }
+              lastErr=`返回不完整(${q.reason}, ${content.length}字)`;
+              console.log(`  (第${round}轮返回不完整: ${q.reason}，${content.length} 字符，finish=${finish} → 提高预算重试)`);
+              maxTok=Math.min(maxTok*2, 32000);
+              continue;
+            }
+            const rc=(choice.message?.reasoning_content||'').length;
+            lastErr=rc?`200 内容为空(reasoning ${rc} 字，推理超限)`:'200 但内容为空';
+            console.log(`  (第${round}轮 ${lastErr}，finish=${finish} → max_tokens ${maxTok}→${Math.min(maxTok*2,32000)})`);
+            if(rc) maxTok=Math.min(maxTok*2, 32000);
+            continue;
+          }
+          lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
+          console.log(`  (HTTP ${r.status}: ${model}/${jsonMode?'json':'text'} @ ${url.replace(/^https?:\/\//,'')})`);
+          if(r.status===404){ deadUrls.add(url); break; }      // 端点不存在 → 本轮起跳过该端点
+          if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ break; }
+          // 401/403 不再把模型永久拉黑（2026-09-17：网关偶发对可用模型返回 401 Model is disabled，
+          // 数分钟后同一模型又恢复正常；拉黑会导致后续轮次无模型可用）。轮数上限已控制总耗时。
+          if(r.status===401||r.status===403){ continue; }
+        }
+      }
+    }
+    if(round<LLM_MAX_ROUNDS && !(deadUrls.size>=urls.length) && !(deadModels.size>=models.length)){
+      console.log(`  重试第 ${round+1}/${LLM_MAX_ROUNDS} 轮（上次: ${String(lastErr).slice(0,80)}）`);
+      await sleep(5000);
     }
   }
-  throw new Error('所有候选端点均失败: '+lastErr);
+  throw new Error('LLM 全部尝试失败: '+lastErr);
+}
+
+// ===== 素材编排 =====
+// 两个目的：① 控制提示词总长度；② 日报类稿件的下游数据（涤丝产销、轻纺城坯布成交、
+// 后市展望）通常出现在正文末尾，纯头部截断会整块丢掉，故采用「头+尾」双端截取。
+const MATERIAL_BUDGET = 45000;   // 素材区总字符预算（过大易触发网关超时）
+const DOWN_RE = /加弹|坯布|织造|织机|轻纺城|纱线|人棉纱|终端|印染|经编|圆机|喷水|下游|涤纶长丝|直纺涤短|氨纶|粘胶|锦纶|再生化纤/;
+
+function excerpt(text, head, tail){
+  const t=String(text||'');
+  if(t.length<=head+tail+30) return t;
+  return `${t.slice(0,head)}\n……（中间数据表略）……\n${t.slice(-tail)}`;
+}
+
+function buildMaterials(articles){
+  const isDeep=a=>/(日报|市场速递)/.test(a.source||'');
+  const weight=a=>isDeep(a)?(a.source==='市场速递'?1.4:2.2):1;
+  // 深度稿按下游相关度优先排序，预算紧张时也能保住下游数据来源
+  const deep=articles.filter(isDeep).sort((a,b)=>(DOWN_RE.test(b.title)?1:0)-(DOWN_RE.test(a.title)?1:0));
+  const ordered=[...deep, ...articles.filter(a=>!isDeep(a))];
+  const totalW=ordered.reduce((s,a)=>s+weight(a),0)||1;
+  const unit=MATERIAL_BUDGET/totalW;
+  return ordered.map((a,i)=>{
+    const b=Math.min(3200, Math.max(420, Math.round(unit*weight(a))));
+    const body=excerpt(a.content||a.summary||'（正文为空）', Math.round(b*0.55), Math.round(b*0.45));
+    return `\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}\n正文:\n${body}\n链接:${a.url}`;
+  }).join('\n');
 }
 
 function buildLLMPrompt(articles, dateStr, rangeStr){
-  const mats=articles.map((a,i)=>`\n【素材${i+1}】来源:${a.source} | 标题:${a.title} | 时间:${a.datetime}${a.contentFrom&&a.contentFrom!=='weixin'?` | 正文转载自:${a.contentFrom}`:''}\n正文:\n${(a.content||a.summary||'').slice(0,2800)}\n链接:${a.url}`).join('\n');
-  return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业资讯素材（来自华瑞信息CCF快讯/晨报/日报/视点评论），梳理整合为一份精炼的行业信息简报。
+  const mats=buildMaterials(articles);
+  return `你是资深化纤行业分析师。请根据以下今日（${dateStr}）采集到的化纤行业资讯素材（来自华瑞信息CCF，含快讯、日报、市场速递），梳理整合为一份精炼的行业信息简报。
 
 ${mats}
 
 【行业边界】
-你关注的是"化纤行业"的核心资讯：涤纶/锦纶/氨纶/粘胶/腈纶等品种的价格涨跌、PTA/乙二醇/聚酯等原料行情、产能开工率、库存变化、进出口数据、产业政策、企业动态、技术创新。以下内容不属于化纤行业简报范畴，请直接忽略：膳食纤维/食物营养、玻璃纤维生活科普与致癌辟谣、微生物纤维素学术论文、木棉纤维实验室研究等与化纤市场无关的内容。
+你关注的是"化纤行业"的完整产业链：涤纶/锦纶/氨纶/粘胶/腈纶等品种的价格涨跌、PTA/乙二醇/聚酯等原料行情、产能开工率、库存变化、进出口数据、产业政策、企业动态、技术创新。**下游纺织环节同样属于本简报范畴**，包括加弹（DTY 加工）、织造（织机开机、喷水/喷气/经编/圆机）、坯布、印染、纱线与终端服装家纺。以下内容不属于简报范畴，请直接忽略：膳食纤维/食物营养、玻璃纤维生活科普与致癌辟谣、微生物纤维素学术论文、木棉纤维实验室研究、纺纱织造工艺技术文献（上浆配方、精梳机选型等纯技术论文）等与市场无关的内容。
+
+【下游需求板块（必须输出）】
+简报中必须包含一个标题为「下游需求：加弹 / 织造 / 坯布」的板块，用于反映终端需求与下游价格。素材主要来自 CCF日报（江浙涤纶长丝市场日报、人棉纱布日报、直纺涤短市场日报、氨纶/锦纶/粘胶/再生化纤日报）与市场速递。按以下线索提取：
+- 加弹：DTY 价格与加工差（DTY-POY 价差）、中小加弹厂报价与开机、加弹厂对 POY 的采购意愿；
+- 织造：江浙终端/织机开机率、喷水/喷气/经编/圆机负荷、织厂订单与库存天数；
+- 坯布：中国轻纺城面料成交量（总量/化纤布/短纤布，万米）、坯布价格（元/米）、成交气氛；
+- 纱线印染：纱厂开机与库存、人棉纱/纯涤纱价格、印染厂生产情况。
+该板块必须用 table 呈现，headers 固定为 ["环节","代表价格/负荷","环比变化","解读"]，rows 按 加弹/织造/坯布/纱线 中当日有素材的环节逐行填写；再配 1-2 段分析，回答"下游需求对上游化纤价格是支撑还是拖累"。
+若当日素材确实没有下游数据，仍要保留该板块，paragraphs 写明"本期素材未涉及下游环节数据（加弹/织造/坯布），无法给出判断"，严禁编造。
 
 【整合要求】
 1. 你是一名分析师，不是摘要机器人。要跨文章交叉整合——把不同素材里提到同一品种/同一主题的信息合并成一条判断，而不是逐条转述每篇文章；
 2. 每条要点要回答"这对市场意味着什么？"，要有分析师的判断力和洞察力；
 3. 严禁编造素材中没有的具体数据；某条素材正文为空时只能依据标题/摘要做有限推断，不能编造细节；
-4. 涨用红色（tag中标注"up"）、跌用绿色（tag中标注"down"）；
-5. 只输出 JSON，不要前后多余文字：
+4. **绝对禁止在 text/paragraphs/title/table 任何文本里输出 HTML 标签、CSS 或颜色样式**。涨跌方向只用 tag 字段表达：涨用 "up"、跌用 "down"、持平用 "stable"、其他主题用中文如"原料/产业/政策/下游/展望"。正文中直接写"上涨0.63%"这样的纯文本即可，由前端负责着色；
+5. 要点中必须至少有 1 条与下游需求（加弹/织造/坯布/终端订单）相关；
+6. 板块顺序建议：原料/成本 → 聚酯与主要产品 → 下游需求 → 再生化纤等其他品种 → 趋势展望；
+7. 只输出 JSON，不要前后多余文字：
 {
-  "highpoints": [{"tag":"价格/产业/政策/展望", "text":"一句话要点，带数据支撑和判断"}],
-  "sections": [{"title":"板块名", "paragraphs":["分析段落…"], "table":{"headers":["指标","数值","同比","解读"],"rows":[["…","…","…","…"]]} }],
+  "highpoints": [{"tag":"up/down/stable/原料/产业/政策/下游/展望", "text":"一句话要点，带数据支撑和判断，纯文本"}],
+  "sections": [{"title":"板块名", "paragraphs":["分析段落…纯文本"], "table":{"headers":["指标","数值","涨跌","解读"],"rows":[["…","…","…","…"]]} }],
   "notes":"数据核实与免责说明"
 }
-板块按当天实际内容组织（价格动态、原料行情、产能变化、企业动向、政策解读、趋势研判等）。全体要点不少于3条、不超过8条。板块按信息密度灵活组织，某个方面没内容就跳过，不硬凑。`;
+板块按当天实际内容组织（价格动态、原料行情、产能变化、企业动向、政策解读、趋势研判等）。全体要点不少于3条、不超过8条。板块按信息密度灵活组织，除「下游需求」板块必须输出外，其他方面没内容就跳过，不硬凑。`;
 }
 
+// 补齐未闭合的字符串/括号
+function closeAll(s){
+  const stack=[]; let inStr=false, esc=false;
+  for(const ch of s){
+    if(inStr){ if(esc){esc=false;} else if(ch==='\\'){esc=true;} else if(ch==='"'){inStr=false;} continue; }
+    if(ch==='"') inStr=true;
+    else if(ch==='{') stack.push('}');
+    else if(ch==='[') stack.push(']');
+    else if(ch==='}'||ch===']') stack.pop();
+  }
+  let out=s;
+  if(inStr) out+='"';
+  while(stack.length) out+=stack.pop();
+  return out;
+}
+// 健壮 JSON 解析：容忍大模型输出被 max_tokens 截断
 function safeParseJSON(text){
-  let t=text.trim();
+  let t=String(text||'').trim();
   const fence=t.match(/```(?:json)?\s*([\s\S]*?)```/i); if(fence) t=fence[1].trim();
-  const s=t.indexOf('{'), e=t.lastIndexOf('}'); if(s>=0&&e>s) t=t.slice(s,e+1);
-  return JSON.parse(t);
+  const s=t.indexOf('{'), e=t.lastIndexOf('}');
+  if(s>=0&&e>s) t=t.slice(s,e+1);
+  try{ return JSON.parse(t); }catch(err){}
+  // 修复：从末尾往前找完整的 } / ] 作为截断点，补齐括号后重试
+  const cands=[];
+  for(let i=t.length-1;i>=0 && cands.length<120;i--){ if(t[i]==='}'||t[i]===']') cands.push(i); }
+  for(const p of cands){
+    try{ return JSON.parse(closeAll(t.slice(0,p+1))); }catch(err){}
+  }
+  throw new Error('JSON 解析失败（含修复尝试）');
+}
+
+// LLM 返回的完整性检查：能否解析出「要点≥3 且 板块≥2」的结构。
+// 背景：网关偶发返回截断或偷懒的短输出（如只有 4 条要点、板块为空），
+// 若直接接受，渲染兜底会生成「只有要点 + 标题列表」的空壳简报（2026-09-17 事故）。
+// 注意 safeParseJSON 会修复截断 JSON，所以这里能拦住「截断到只剩要点部分」的情况。
+function qualityCheck(text){
+  let d;
+  try{ d=safeParseJSON(text); }catch(e){ return { ok:false, reason:'无法解析为JSON' }; }
+  const hp=Array.isArray(d&&d.highpoints)?d.highpoints.filter(x=>x&&String(x.text||'').trim()):[];
+  const sec=Array.isArray(d&&d.sections)?d.sections.filter(s=>s&&(Array.isArray(s.paragraphs)&&s.paragraphs.length>0||s.table)):[];
+  if(hp.length<3) return { ok:false, reason:`要点仅${hp.length}条(<3)` };
+  if(sec.length<2) return { ok:false, reason:`板块仅${sec.length}个(<2)` };
+  return { ok:true, hp:hp.length, sec:sec.length };
 }
 
 // ===== HTML 渲染 =====
@@ -278,6 +432,9 @@ body{font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif;b
 .card h2{font-size:18px;color:#1e5799;margin-bottom:14px;padding-bottom:10px;border-bottom:2px solid #eaf2fb}
 .card h3{font-size:15px;color:#1e3a5c;margin:16px 0 8px}
 .card p{font-size:14.5px;color:#4a5b6c;margin-bottom:10px}
+/* 下游需求板块：暖色描边，与上游行情视觉区分 */
+.card.downstream{border-left:5px solid #e0a13a;background:linear-gradient(180deg,#fffdf8,#fff)}
+.card.downstream h2{color:#a9741c;border-bottom-color:#fbf1de}
 .summary-box{background:linear-gradient(135deg,#f0f7ff,#eef4fb);border-left:5px solid #2d72b8;border-radius:10px;padding:18px 22px;margin-bottom:14px}
 .summary-box ul{padding-left:18px}.summary-box li{font-size:14.5px;color:#2c3e50;margin-bottom:8px}
 table{width:100%;border-collapse:collapse;margin:12px 0 16px;font-size:13.5px}
@@ -286,6 +443,8 @@ td{padding:8px 12px;border:1px solid #eef2f6;color:#4a5b6c}
 tr:nth-child(even) td{background:#fafcfe}
 .flag{display:inline-block;font-size:12px;border-radius:4px;padding:1px 8px;margin-right:6px}
 .flag.hot{background:#fdeeee;color:#c0392b}.flag.mid{background:#fff7e0;color:#8a6d1f}
+.flag.up{background:#fdeeee;color:#c0392b}.flag.down{background:#e8f6ee;color:#27ae60}
+.flag.stable{background:#eef2f6;color:#5b6b7a}
 .up{color:#c0392b;font-weight:600}.down{color:#27ae60;font-weight:600}
 .src{font-size:12.5px;color:#8b99a7;margin-top:8px}.src a{color:#2d72b8;text-decoration:none}.src a:hover{text-decoration:underline}
 .note{font-size:12.5px;color:#93a3b1;margin-top:8px}
@@ -295,29 +454,65 @@ tr:nth-child(even) td{background:#fafcfe}
 .index-item .date{font-size:13px;color:#8b99a7;margin-left:auto;flex-shrink:0}
 `;
 
+// 把模型返回的任意结构标准化，避免空对象/缺字段导致渲染崩溃
+function sanitizeData(d){
+  const out=(d&&typeof d==='object')?d:{};
+  // 要点
+  const hp=Array.isArray(out.highpoints)?out.highpoints:[];
+  out.highpoints=hp.filter(x=>x&&String(x.text||'').trim()).map(x=>({
+    tag:String(x.tag||'资讯'),
+    text:String(x.text||'').trim(),
+  }));
+  // 板块
+  const secs=Array.isArray(out.sections)?out.sections:[];
+  out.sections=secs.filter(s=>s&&typeof s==='object').map(s=>{
+    const r={ title:String(s.title||'未命名板块').trim() };
+    r.paragraphs=(Array.isArray(s.paragraphs)?s.paragraphs:[])
+      .map(p=>String(p==null?'':p).trim()).filter(p=>p);
+    // table 只有 headers 与 rows 都是非空数组时才算有效
+    const t=s.table;
+    if(t&&typeof t==='object'&&Array.isArray(t.headers)&&t.headers.length>0
+       &&Array.isArray(t.rows)&&t.rows.filter(r0=>Array.isArray(r0)&&r0.length>0).length>0){
+      r.table={ headers:t.headers.map(x=>String(x==null?'':x)), rows:t.rows.filter(r0=>Array.isArray(r0)&&r0.length>0) };
+    }
+    return r;
+  }).filter(s=>s.paragraphs.length>0||s.table);
+  out.notes=typeof out.notes==='string'?out.notes:'';
+  return out;
+}
+
 function renderSection(sec){
-  let h=`<div class="card"><h2>${esc(sec.title)}</h2>`;
+  const isDown=/下游/.test(String(sec.title||''));
+  let h=`<div class="card${isDown?' downstream':''}"><h2>${esc(sec.title)}</h2>`;
   for(const p of (sec.paragraphs||[])){
-    // 简易着色：含"涨/增/升/+"的数字不强行改色，仅按 up/down 标记
-    h+=`<p>${esc(p)}</p>`;
+    h+=`<p>${colorize(esc(stripTags(p)))}</p>`;
   }
-  if(sec.table){
-    h+=`<table><tr>`+sec.table.headers.map(x=>`<th>${esc(x)}</th>`).join('')+`</tr>`;
-    for(const row of sec.table.rows){ h+=`<tr>`+row.map(x=>`<td>${esc(x)}</td>`).join('')+`</tr>`; }
+  const t=sec.table;
+  if(t&&Array.isArray(t.headers)&&t.headers.length>0&&Array.isArray(t.rows)&&t.rows.length>0){
+    h+=`<table><tr>`+t.headers.map(x=>`<th>${esc(stripTags(x))}</th>`).join('')+`</tr>`;
+    for(const row of t.rows){ h+=`<tr>`+row.map(x=>`<td>${colorize(esc(stripTags(x)))}</td>`).join('')+`</tr>`; }
     h+=`</table>`;
   }
   h+=`</div>`; return h;
 }
+// 按 tag 生成彩色标签
+function tagClass(tag){
+  const t=String(tag||'').toLowerCase();
+  if(t.includes('up')||t.includes('涨')) return 'up';
+  if(t.includes('down')||t.includes('跌')) return 'down';
+  if(t.includes('stable')||t.includes('稳')||t.includes('平')||t.includes('持')) return 'stable';
+  return 'mid';
+}
 function renderDaily(dateStr,rangeStr,data,sources){
-  const hp=(data.highpoints||[]).map(h=>`<li><span class="flag ${h.tag==='价格'?'hot':'mid'}">${esc(h.tag)}</span>${esc(h.text)}</li>`).join('');
+  const hp=(data.highpoints||[]).map(h=>`<li><span class="flag ${tagClass(h.tag)}">${esc(tagLabel(h.tag))}</span>${colorize(esc(stripTags(h.text)))}</li>`).join('');
   const secs=(data.sections||[]).map(renderSection).join('');
   const srcRows=sources.map(s=>`<tr><td>${esc(s.source)}</td><td><a href="${esc(s.url)}" target="_blank">${esc(s.title)}</a></td><td>${esc((s.datetime||'').slice(0,16))}</td></tr>`).join('');
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>化纤行业信息简报 · ${dateStr}</title><style>${CSS}</style></head><body><div class="container">
-<div class="header"><div class="badge">每日信息简报 · 内容整合版</div><h1>化纤行业信息简报</h1><div class="meta">${dateStr} · 统计区间：${rangeStr}（过去24小时，北京时间）</div></div>
+<div class="header"><div class="badge">每日信息简报 · 内容整合版</div><h1>化纤行业信息简报</h1><div class="meta">${dateStr} · 快讯统计区间：${rangeStr}（北京时间）</div></div>
 <div class="card"><h2>今日要点</h2><div class="summary-box"><ul>${hp}</ul></div></div>
 ${secs}
-<div class="card"><h2>本期信息来源</h2><table><tr><th>栏目</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(data.notes||'')}</p></div>
-<div class="footer">化纤行业信息简报 · 由 GitHub Actions + DeepSeek 每日自动整合 · ${dateStr}<br>数据来源：华瑞信息CCF化纤信息网（快讯/晨报/日报/视点评论），仅收录过去24小时发布的资讯</div>
+<div class="card"><h2>本期信息来源</h2><table><tr><th>栏目</th><th>标题</th><th>发布时间</th></tr>${srcRows}</table><p class="note">${esc(stripTags(data.notes||''))}</p></div>
+<div class="footer">化纤行业信息简报 · 由 GitHub Actions + 大模型每日自动整合 · ${dateStr}<br>数据来源：华瑞信息CCF化纤信息网（快讯 / 日报 / 市场速递）<br>快讯为近 24 小时内容，日报与市场速递回溯 72 小时以覆盖非交易日</div>
 </div></body></html>`;
 }
 function renderIndex(briefings){
@@ -333,37 +528,62 @@ async function main(){
   const now=nowBeijing(), cutoff=new Date(now.getTime()-24*60*60*1000);
   const dateStr=beijingDateStr(now), rangeStr=`${beijingStr(cutoff).slice(0,16)} — ${beijingStr(now).slice(0,16)}`;
   console.log(`生成日期: ${dateStr}，区间: ${rangeStr}`);
+  console.log(`配置：数据源=${DATA_SOURCE}；LLM模型候选=${llmModels().join('/')}；LLM端点=${LLM_BASE}；密钥=${LLM_API_KEY?'已配置('+LLM_API_KEY.length+'位)':'未配置'}`);
 
   // CCF 网页采集（登录→抓列表→抓正文）
   let enriched=[];
-  if(CCF_USER && CCF_PASS){
+  // 本地迭代用：REUSE_DEBUG=1 跳过采集，复用上次 debug_last.json（省去 2-5 分钟抓取）——线上不设置此变量
+  if(process.env.REUSE_DEBUG==='1'){
+    try{
+      enriched=JSON.parse(fs.readFileSync(path.join(__dirname,'..','debug_last.json'),'utf-8'));
+      console.log(`[REUSE_DEBUG] 复用缓存 ${enriched.length} 篇，跳过 CCF 采集`);
+    }catch(e){ console.log('[REUSE_DEBUG] 缓存不可用，转为正常采集: '+e.message); }
+  }
+  if(enriched.length===0 && CCF_USER && CCF_PASS){
     console.log('使用 CCF 网页源采集...');
     enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
-  }else{
+  }else if(enriched.length===0){
     console.log('未配置 CCF_USERNAME/CCF_PASSWORD，无数据源');
   }
   console.log(`采集完成，共 ${enriched.length} 篇`);
 
-  // 只选今天的新文章
-  const selected=enriched.filter(a=>isFresh(a,cutoff.getTime()));
+  // 只选时间窗内的新文章；若一篇都没有，退回使用列表中最新的若干篇
+  let selected=enriched.filter(a=>isFresh(a,now));
+  let usingFallback=false;
+  if(selected.length===0 && enriched.length>0){
+    selected=enriched.slice(0,10);
+    usingFallback=true;
+    console.log('今日无新增文章，退回使用列表最新的 '+selected.length+' 篇');
+  }
   console.log(`当日文章 ${selected.length} 篇`);
 
   try{ fs.writeFileSync(path.join(__dirname,'..','debug_last.json'), JSON.stringify(enriched,null,2),'utf-8'); }catch{}
 
   let data;
   if(LLM_API_KEY && selected.length>0){
-    console.log('调用 DeepSeek 整合...');
+    console.log('调用大模型整合...');
     try{
       const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
-      data=safeParseJSON(resp);
+      data=sanitizeData(safeParseJSON(resp));
+      // 兜底：若解析结果缺要点或板块（例如输出被截断），用标题列表补齐
+      if(!Array.isArray(data.highpoints)||data.highpoints.length===0){
+        data.highpoints=selected.slice(0,5).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`}));
+      }
+      if(!Array.isArray(data.sections)||data.sections.length===0){
+        data.sections=[{title:'当日资讯列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime.slice(11,16)}）`)}];
+      }
+      // 兜底：确保「下游需求」板块一定出现（缺数据时明确说明，不编造）
+      if(!data.sections.some(s=>/下游/.test(String(s&&s.title||'')))){
+        data.sections.push({title:'下游需求：加弹 / 织造 / 坯布',paragraphs:['本期素材未涉及下游环节数据（加弹/织造/坯布），无法给出判断。']});
+      }
       console.log('整合完成，要点 '+(data.highpoints||[]).length+' 条，板块 '+(data.sections||[]).length+' 个');
     }catch(e){
       console.error('LLM 失败，降级为标题列表: '+e.message);
-      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。' };
+      data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。原因：'+e.message };
     }
   }else{
-    console.log('未配置 LLM_API_KEY，生成简单列表版');
-    data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
+    console.log(LLM_API_KEY?('无可用文章（采集到 '+enriched.length+' 篇）'):'未配置 LLM_API_KEY');
+    data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
   fs.mkdirSync(SITE_DIR,{recursive:true});
@@ -384,4 +604,5 @@ async function main(){
   }catch{}
 }
 
-main().catch(e=>{ console.error('失败:',e); process.exit(1); });
+if(require.main===module){ main().catch(e=>{ console.error('失败:',e); process.exit(1); }); }
+module.exports={ callLLM, buildLLMPrompt, buildMaterials, excerpt, llmEndpoints, llmModels, renderDaily, sanitizeData, qualityCheck };
