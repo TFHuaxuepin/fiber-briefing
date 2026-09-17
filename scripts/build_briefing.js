@@ -269,7 +269,19 @@ async function callLLM(prompt){
           if(r.status===200){
             let data; try{ data=JSON.parse(r.raw); }catch(e){ lastErr='响应非JSON'; continue; }
             const content=data.choices?.[0]?.message?.content||'';
-            if(content){ console.log(`LLM 成功: model=${model}, url=${url.replace(/^https?:\/\//,'')}, json=${jsonMode}`); return content; }
+            if(content){
+              // 完整性门槛：残缺输出（截断/模型偷懒只给要点）不能当成功接受，
+              // 否则会生成「只有要点、板块空壳」的降级简报（2026-09-17 事故）。
+              // 判据：可解析为 JSON + 要点≥3 + 板块≥2（与渲染兜底阈值一致）。
+              const q=qualityCheck(content);
+              if(q.ok){
+                console.log(`LLM 成功: model=${model}, url=${url.replace(/^https?:\/\//,'')}, json=${jsonMode}, 返回 ${content.length} 字符`);
+                return content;
+              }
+              lastErr=`返回不完整(${q.reason}, ${content.length}字)`;
+              console.log(`  (第${round}轮返回不完整: ${q.reason}，${content.length} 字符 → 换下一个尝试)`);
+              continue;
+            }
             lastErr='200 但内容为空'; continue;
           }
           lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
@@ -378,6 +390,20 @@ function safeParseJSON(text){
     try{ return JSON.parse(closeAll(t.slice(0,p+1))); }catch(err){}
   }
   throw new Error('JSON 解析失败（含修复尝试）');
+}
+
+// LLM 返回的完整性检查：能否解析出「要点≥3 且 板块≥2」的结构。
+// 背景：网关偶发返回截断或偷懒的短输出（如只有 4 条要点、板块为空），
+// 若直接接受，渲染兜底会生成「只有要点 + 标题列表」的空壳简报（2026-09-17 事故）。
+// 注意 safeParseJSON 会修复截断 JSON，所以这里能拦住「截断到只剩要点部分」的情况。
+function qualityCheck(text){
+  let d;
+  try{ d=safeParseJSON(text); }catch(e){ return { ok:false, reason:'无法解析为JSON' }; }
+  const hp=Array.isArray(d&&d.highpoints)?d.highpoints.filter(x=>x&&String(x.text||'').trim()):[];
+  const sec=Array.isArray(d&&d.sections)?d.sections.filter(s=>s&&(Array.isArray(s.paragraphs)&&s.paragraphs.length>0||s.table)):[];
+  if(hp.length<3) return { ok:false, reason:`要点仅${hp.length}条(<3)` };
+  if(sec.length<2) return { ok:false, reason:`板块仅${sec.length}个(<2)` };
+  return { ok:true, hp:hp.length, sec:sec.length };
 }
 
 // ===== HTML 渲染 =====
@@ -566,4 +592,4 @@ async function main(){
 }
 
 if(require.main===module){ main().catch(e=>{ console.error('失败:',e); process.exit(1); }); }
-module.exports={ callLLM, buildLLMPrompt, buildMaterials, excerpt, llmEndpoints, llmModels, renderDaily, sanitizeData };
+module.exports={ callLLM, buildLLMPrompt, buildMaterials, excerpt, llmEndpoints, llmModels, renderDaily, sanitizeData, qualityCheck };
