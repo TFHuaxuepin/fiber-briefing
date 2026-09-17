@@ -44,5 +44,29 @@ const keep = sanitizeData({ highpoints: [{ tag: 'up', text: 'a' }], sections: [{
 if (keep.sections[0].table && keep.sections[0].table.rows.length === 1) console.log('PASS  有效 table 被保留');
 else { console.log('FAIL  有效 table 被误删'); fail++; }
 
+// ===== qualityCheck：拦截残缺 LLM 输出（2026-09-17 事故：只给 4 条要点、板块为空） =====
+const { qualityCheck } = require('./build_briefing.js');
+const good = JSON.stringify({
+  highpoints: [{ tag: 'up', text: 'a' }, { tag: 'down', text: 'b' }, { tag: '原料', text: 'c' }],
+  sections: [{ title: 'A', paragraphs: ['p1', 'p2'] }, { title: 'B', paragraphs: ['p3'] }],
+});
+if (qualityCheck(good).ok) console.log('PASS  qualityCheck 完整输出通过');
+else { console.log('FAIL  qualityCheck 完整输出被误拒'); fail++; }
+
+// 事故现场：截断到只剩 highpoints（closeAll 修复后可解析，但板块缺失）
+const truncated = '{"highpoints":[{"tag":"up","text":"a"},{"tag":"down","text":"b"},{"tag":"x","text":"c"},{"tag":"y","text":"d"';
+const qc1 = qualityCheck(truncated);
+if (!qc1.ok && /板块/.test(qc1.reason)) console.log('PASS  qualityCheck 拦截"只有要点"的截断输出 → ' + qc1.reason);
+else { console.log('FAIL  qualityCheck 未拦截截断输出: ' + JSON.stringify(qc1)); fail++; }
+
+// 板块为空的偷懒输出
+const lazy = JSON.stringify({ highpoints: [{ text: 'a' }, { text: 'b' }, { text: 'c' }], sections: [] });
+if (!qualityCheck(lazy).ok) console.log('PASS  qualityCheck 拦截空板块输出');
+else { console.log('FAIL  qualityCheck 未拦截空板块'); fail++; }
+
+// 非法文本
+if (!qualityCheck('抱歉，我无法完成这个任务。').ok) console.log('PASS  qualityCheck 拦截非JSON文本');
+else { console.log('FAIL  qualityCheck 未拦截非JSON'); fail++; }
+
 console.log(fail === 0 ? '\nALL PASS' : `\n${fail} CASE(S) FAILED`);
 process.exit(fail === 0 ? 0 : 1);
