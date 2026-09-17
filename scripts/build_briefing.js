@@ -250,7 +250,11 @@ async function callLLM(prompt){
   const deadUrls=new Set();
   const deadModels=new Set();
   let lastErr='';
-  console.log(`  提示词 ${prompt.length} 字符，超时阈值 ${Math.round(LLM_TIMEOUT/1000)}s`);
+  // 输出预算自适应：deepseek-v4-pro 是推理模型，reasoning 与正文共用 max_tokens。
+  // 推理超限（正文为空但 reasoning 很长）或输出截断时自动倍增预算重试（2026-09-17 事故：
+  // 固定 8000 被推理全部吃掉，正文 0 字）。可用 LLM_MAX_TOKENS 覆盖初始值。
+  let maxTok=Number(process.env.LLM_MAX_TOKENS||8000);
+  console.log(`  提示词 ${prompt.length} 字符，max_tokens=${maxTok}，超时阈值 ${Math.round(LLM_TIMEOUT/1000)}s`);
   // 多轮重试：网关长文本生成偶发超时/断连，单轮失败不代表端点不可用，
   // 只有 404 才判定端点失效（deadUrls），鉴权/模型问题才换模型（deadModels）。
   for(let round=1; round<=LLM_MAX_ROUNDS; round++){
@@ -260,7 +264,7 @@ async function callLLM(prompt){
         if(deadUrls.has(url)) continue;
         for(const jsonMode of [true,false]){
           const body=JSON.stringify(Object.assign(
-            { model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:8000 },
+            { model, messages:[{role:'user',content:prompt}], temperature:0.4, max_tokens:maxTok },
             jsonMode?{response_format:{type:'json_object'}}:{}
           ));
           let r;
@@ -268,23 +272,28 @@ async function callLLM(prompt){
           catch(e){ lastErr=`${e.message} @ ${url}`; console.log(`  (第${round}轮失败: ${model}/${jsonMode?'json':'text'} → ${e.message})`); continue; }
           if(r.status===200){
             let data; try{ data=JSON.parse(r.raw); }catch(e){ lastErr='响应非JSON'; continue; }
-            const content=data.choices?.[0]?.message?.content||'';
+            const choice=data.choices?.[0]||{};
+            const content=choice.message?.content||'';
+            const finish=choice.finish_reason||'';
             if(content){
               // 完整性门槛：残缺输出（截断/模型偷懒只给要点）不能当成功接受，
               // 否则会生成「只有要点、板块空壳」的降级简报（2026-09-17 事故）。
               // 判据：可解析为 JSON + 要点≥3 + 板块≥2（与渲染兜底阈值一致）。
               const q=qualityCheck(content);
               if(q.ok){
-                console.log(`LLM 成功: model=${model}, url=${url.replace(/^https?:\/\//,'')}, json=${jsonMode}, 返回 ${content.length} 字符`);
+                console.log(`LLM 成功: model=${model}, url=${url.replace(/^https?:\/\//,'')}, json=${jsonMode}, max_tokens=${maxTok}, 返回 ${content.length} 字符`);
                 return content;
               }
               lastErr=`返回不完整(${q.reason}, ${content.length}字)`;
-              console.log(`  (第${round}轮返回不完整: ${q.reason}，${content.length} 字符 → 换下一个尝试)`);
+              console.log(`  (第${round}轮返回不完整: ${q.reason}，${content.length} 字符，finish=${finish} → 提高预算重试)`);
+              maxTok=Math.min(maxTok*2, 32000);
               continue;
             }
-            const rc=(data.choices?.[0]?.message?.reasoning_content||'').length;
-            lastErr=rc?`200 内容为空(reasoning ${rc} 字，疑似推理超限)`:'200 但内容为空';
-            console.log(`  (第${round}轮 ${lastErr})`); continue;
+            const rc=(choice.message?.reasoning_content||'').length;
+            lastErr=rc?`200 内容为空(reasoning ${rc} 字，推理超限)`:'200 但内容为空';
+            console.log(`  (第${round}轮 ${lastErr}，finish=${finish} → max_tokens ${maxTok}→${Math.min(maxTok*2,32000)})`);
+            if(rc) maxTok=Math.min(maxTok*2, 32000);
+            continue;
           }
           lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
           console.log(`  (HTTP ${r.status}: ${model}/${jsonMode?'json':'text'} @ ${url.replace(/^https?:\/\//,'')})`);
