@@ -29,7 +29,7 @@ jobs:
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       # 单次请求超时 5 分钟、最多 2 轮，避免网关抖动直接降级为标题列表（最坏 10 分钟）
       LLM_TIMEOUT_MS: '300000'
-      LLM_MAX_ROUNDS: '2'
+      LLM_MAX_ROUNDS: '3'
       SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
       CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
       CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
