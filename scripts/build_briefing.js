@@ -13,9 +13,8 @@ const CCF_USER = process.env.CCF_USERNAME || '';
 const CCF_PASS = process.env.CCF_PASSWORD || '';
 const DATA_SOURCE = CCF_USER ? '华瑞CCF化纤信息网' : '无（请配置CCF_USERNAME/CCF_PASSWORD）';
 const SITE_DIR = path.join(__dirname, '..', 'site');
-const NODE_MODULES = 'C:/Users/24428/.workbuddy/binaries/node/workspace/node_modules';
 let cheerio = null;
-try { cheerio = require(path.join(NODE_MODULES, 'cheerio')); } catch { try { cheerio = require('cheerio'); } catch {} }
+try { cheerio = require('cheerio'); } catch {}
 
 const LLM_API_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || '';
 const LLM_BASE = process.env.LLM_BASE_URL || 'https://token.chinaunicomglobal.com';
@@ -604,5 +603,18 @@ async function main(){
   }catch{}
 }
 
-if(require.main===module){ main().catch(e=>{ console.error('失败:',e); process.exit(1); }); }
+// 失败原因落盘：workflow 里「失败告警」是独立步骤，拿不到上一步的 stdout，
+// 用它把原因传给 notify_failure.js，让告警带上具体原因与处置建议。
+const FAIL_REASON_FILE = path.join(__dirname, '..', 'failure_reason.txt');
+function writeFailReason(msg) {
+  try { fs.writeFileSync(FAIL_REASON_FILE, String(msg || '').slice(0, 500), 'utf-8'); } catch {}
+}
+function clearFailReason() {
+  try { fs.unlinkSync(FAIL_REASON_FILE); } catch {}
+}
+
+if(require.main===module){
+  clearFailReason();
+  main().catch(e=>{ console.error('失败:',e); writeFailReason(e && e.message ? e.message : e); process.exit(1); });
+}
 module.exports={ callLLM, buildLLMPrompt, buildMaterials, excerpt, llmEndpoints, llmModels, renderDaily, sanitizeData, qualityCheck };
