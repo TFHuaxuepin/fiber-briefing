@@ -339,6 +339,12 @@ async function fetchCCFArticles(username, password) {
     const inWindow = arts.filter(a => { const d = (a.datetime || '').slice(0, 10); return d >= from && d <= to; });
     let picked = inWindow.slice(0, col.maxArticles);
     console.log(`    -> 列表 ${arts.length} 篇，窗口内 ${inWindow.length} 篇，采用 ${picked.length} 篇`);
+    // 窗口内为 0 是异常信号：多半是列表页被 CDN 缓存成旧快照（常见于会话失效时），
+    // 打印列表里的日期分布，便于一眼判断是「站点真没更新」还是「拿到旧页面」。
+    if (arts.length > 0 && inWindow.length === 0) {
+      const dates = [...new Set(arts.map(a => (a.datetime || '?').slice(0, 10)))].sort();
+      console.log(`    [警告] ${col.name} 列表无窗口内文章（窗口 ${from} ~ ${to}），列表内日期：${dates.join(', ')}`);
+    }
 
     for (const a of picked) {
       if (seen.has(a.url)) continue;
@@ -376,4 +382,4 @@ async function fetchCCFArticles(username, password) {
   return enriched;
 }
 
-module.exports = { fetchCCFArticles, login, fetchCCFArticles, COLUMNS };
+module.exports = { fetchCCFArticles, login, fetchCCFArticles, COLUMNS, fetchList, fetchContent };
