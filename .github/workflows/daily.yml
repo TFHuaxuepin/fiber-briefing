@@ -2,8 +2,10 @@ name: Daily Fiber Briefing
 
 on:
   schedule:
-    # UTC 01:00 = 北京时间 09:00，每天执行
-    - cron: '0 1 * * *'
+    # UTC 01:00 = 北京时间 09:00，周一~周六执行（UTC 的 1-6 即北京的周一到周六）
+    # 周日休刊（2026-09-19 用户决定）：CCF 日报周末不更新，且周日无法续期 Cookie
+    # （CCF 登录受 IP 报备白名单限制，周末不在办公室网络）
+    - cron: '0 1 * * 1-6'
   workflow_dispatch:
     inputs:
       skip_dingtalk:
