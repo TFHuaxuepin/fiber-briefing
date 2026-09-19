@@ -114,6 +114,10 @@ async function login(username, password) {
   let lastDiag = '';
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let cookies = '';
+    // 「错误位为空」＝凭据校验通过但服务端不下发会话（2026-09-19 定案：最常见原因是**
+    // 当前网络 IP 不在 CCF 报备的白名单里**，站点对此静默拒绝）。
+    // 这种失败重试 100 次也不会成功，且反复登录可能加剧风控 —— 一旦命中就直接放弃。
+    let noSessionReject = false;
     try {
       // Step1: 先访问「登录页」建立会话。
       // 注意：2026-09-19 起 GET / 不再下发任何 Cookie（疑似 CDN/缓存策略变化），
@@ -186,6 +190,7 @@ async function login(username, password) {
         //            这种情况不要反复重试登录，重试无用且可能触发风控（2026-09-19 实测）
         const redBox = (raw.match(/<font color="red">([\s\S]*?)<\/font>/i) || [])[1];
         const redMsg = redBox !== undefined ? redBox.replace(/<[^>]+>/g, '').trim() : '(未找到错误位)';
+        noSessionReject = (redBox !== undefined && redMsg === '');
         diag = `错误位="${redMsg}"`
           + ` | 可见文本=${text.slice(0, 400)}`
           + (kw ? ` || 关键提示=${kw[0]}` : '')
@@ -196,6 +201,12 @@ async function login(username, password) {
     } catch (e) {
       lastDiag = `第 ${attempt} 次：请求异常 ${e.message}`;
       console.error(`[CCF] 登录请求异常（${lastDiag}）`);
+    }
+    if (noSessionReject) {
+      console.error('[CCF] 判定为「凭据通过但服务端拒绝下发会话」（错误位为空）→ 不再重试。'
+        + '最常见原因：当前网络 IP 未在 CCF 报备（如家用宽带/手机热点）。'
+        + '请改用报备过的网络（办公室），或联系 CCF 追加报备 IP。');
+      break;
     }
     if (attempt < MAX_ATTEMPTS) {
       const wait = 4000 * attempt;
