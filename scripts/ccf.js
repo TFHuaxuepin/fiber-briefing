@@ -115,9 +115,18 @@ async function login(username, password) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let cookies = '';
     try {
-      // Step1: 获取 session
-      const s1 = await request({url: `${BASE}/`});
+      // Step1: 先访问「登录页」建立会话。
+      // 注意：2026-09-19 起 GET / 不再下发任何 Cookie（疑似 CDN/缓存策略变化），
+      // 若仍用首页预热，POST 会在「无会话」状态下发出，服务端直接原样重渲染登录页
+      // 并返回空错误提示（<font color="red"></font>），表现为「HTTP 200 但拿不到 uid」。
+      // 登录页 GET 稳定下发 PHPSESSID，因此改为以登录页预热；首页作为兜底。
+      const s1 = await request({url: `${BASE}/member/member.php`});
       cookies = mergeCookies(cookies, s1.headers['set-cookie']);
+      if (!cookies) {
+        const s1b = await request({url: `${BASE}/`});
+        cookies = mergeCookies(cookies, s1b.headers['set-cookie']);
+        console.log(`[CCF] 登录页未下发会话 cookie，已用首页兜底（${cookies ? '已获取' : '仍为空'}）`);
+      }
 
       // Step2: POST 登录
       const body = querystring.stringify({
@@ -140,7 +149,7 @@ async function login(username, password) {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Cookie': cookies,
           'Origin': BASE,
-          'Referer': `${BASE}/`,
+          'Referer': `${BASE}/member/member.php`,
         },
         body,
       });
@@ -171,11 +180,18 @@ async function login(username, password) {
           .trim();
         // 优先抽取与失败有关的片段
         const kw = text.match(/.{0,60}(密码|验证码|错误|失败|不正确|锁定|冻结|异地|频繁|限制|验证).{0,80}/);
-        diag = `可见文本=${text.slice(0, 400)}`
+        // 登录页模板把错误写进 <font color="red">…</font>：
+        //   有文案 = 凭据被拒（账号/密码问题）
+        //   空文案 = 凭据通过但服务端未下发会话（账号状态问题，如停用/到期/需验证），
+        //            这种情况不要反复重试登录，重试无用且可能触发风控（2026-09-19 实测）
+        const redBox = (raw.match(/<font color="red">([\s\S]*?)<\/font>/i) || [])[1];
+        const redMsg = redBox !== undefined ? redBox.replace(/<[^>]+>/g, '').trim() : '(未找到错误位)';
+        diag = `错误位="${redMsg}"`
+          + ` | 可见文本=${text.slice(0, 400)}`
           + (kw ? ` || 关键提示=${kw[0]}` : '')
           + ` || body长度=${raw.length}`;
       } catch (e) { diag = `(解析响应失败 ${e.message})`; }
-      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | location=${s2.headers.location || '(无)'} | POST set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 160)} | 首页 HTTP ${s1.status} set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 160)} | ${diag}`;
+      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | location=${s2.headers.location || '(无)'} | POST set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 160)} | 预热页 HTTP ${s1.status} set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 160)} | ${diag}`;
       console.error(`[CCF] 登录未拿到 uid cookie（${lastDiag}）`);
     } catch (e) {
       lastDiag = `第 ${attempt} 次：请求异常 ${e.message}`;
