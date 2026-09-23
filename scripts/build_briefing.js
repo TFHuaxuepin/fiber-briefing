@@ -13,6 +13,12 @@ const CCF_USER = process.env.CCF_USERNAME || '';
 const CCF_PASS = process.env.CCF_PASSWORD || '';
 const DATA_SOURCE = CCF_USER ? '华瑞CCF化纤信息网' : '无（请配置CCF_USERNAME/CCF_PASSWORD）';
 const SITE_DIR = path.join(__dirname, '..', 'site');
+// 本地 AI 模式（2026-09-23 起）：外部 LLM 配额受限时，改由本机 WorkBuddy 生成简报内容。
+// 约定：<repo>/data/<日期>.json 存放本地生成的内容结构（highpoints/sections/notes）；
+//      该文件存在即优先使用、跳过 callLLM；配额恢复后不再生成该文件即自动回到云端 LLM。
+// AGENT_MODE=prepare：只做采集并把提示词导出到 data/<日期>.prompt.txt，供本机生成内容，不调用任何 LLM。
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const AGENT_MODE = process.env.AGENT_MODE || '';
 let cheerio = null;
 try { cheerio = require('cheerio'); } catch {}
 
@@ -558,8 +564,36 @@ async function main(){
 
   try{ fs.writeFileSync(path.join(__dirname,'..','debug_last.json'), JSON.stringify(enriched,null,2),'utf-8'); }catch{}
 
+  // 模式一：只采集并导出提示词，交给本机 WorkBuddy 生成内容（不调用任何 LLM）
+  if(AGENT_MODE==='prepare'){
+    if(selected.length===0) console.log('[AGENT] 警告：当日窗口内 0 篇文章，导出的提示词将不含素材');
+    const prompt=buildLLMPrompt(selected,dateStr,rangeStr);
+    fs.mkdirSync(DATA_DIR,{recursive:true});
+    const promptFile=path.join(DATA_DIR,`${dateStr}.prompt.txt`);
+    fs.writeFileSync(promptFile,prompt,'utf-8');
+    console.log(`[AGENT] 提示词已导出（${prompt.length} 字符）：${promptFile}`);
+    console.log(`[AGENT] 下一步：据此生成 data/${dateStr}.json，然后不带 AGENT_MODE 重新运行本脚本`);
+    return;
+  }
+
+  // 模式二：若本地已生成当日内容（data/<日期>.json），优先采用，跳过 callLLM。
+  // 这是「配额受限时由本机出内容、云端只负责渲染与推送」的核心开关。
   let data;
-  if(LLM_API_KEY && selected.length>0){
+  let usedLocal=false;
+  const localJsonFile=path.join(DATA_DIR,`${dateStr}.json`);
+  if(selected.length>0 && fs.existsSync(localJsonFile)){
+    const raw=fs.readFileSync(localJsonFile,'utf-8');
+    const q=qualityCheck(raw);
+    if(q.ok){
+      data=sanitizeData(safeParseJSON(raw));
+      usedLocal=true;
+      console.log(`[LOCAL] 采用本地生成内容 ${localJsonFile}（要点 ${(data.highpoints||[]).length} 条，板块 ${(data.sections||[]).length} 个）`);
+    }else{
+      console.log(`[LOCAL] 本地内容不可用（${q.reason}），回退云端 LLM`);
+    }
+  }
+
+  if(!usedLocal && LLM_API_KEY && selected.length>0){
     console.log('调用大模型整合...');
     try{
       const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
@@ -580,7 +614,7 @@ async function main(){
       console.error('LLM 失败，降级为标题列表: '+e.message);
       data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。原因：'+e.message };
     }
-  }else{
+  }else if(!usedLocal){
     console.log(LLM_API_KEY?('无可用文章（采集到 '+enriched.length+' 篇）'):'未配置 LLM_API_KEY');
     data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
@@ -589,7 +623,8 @@ async function main(){
   // 若本次产出为降级内容（LLM 整合失败 / 无文章 / 未配置 Key），而站点上已存在同日简报，
   // 则直接判失败并保留既有完整版，绝不覆盖。workflow 的「失败告警」步骤会推送原因。
   // 首次运行（当日文件尚不存在）仍按原设计降级发布，不影响「宁可降级也不缺稿」的取舍。
-  const degraded = !LLM_API_KEY || selected.length===0
+  // 注意：本地生成内容（usedLocal）不属于降级——配额受限期它就是正常产出路径
+  const degraded = (!LLM_API_KEY && !usedLocal) || selected.length===0
     || String(data.notes||'').includes('智能整合失败')
     || String(data.notes||'').includes('未配置');
   fs.mkdirSync(SITE_DIR,{recursive:true});
@@ -608,7 +643,7 @@ async function main(){
   try{
     fs.writeFileSync(path.join(__dirname,'..','notify.json'), JSON.stringify({
       date: dateStr, range: rangeStr, sources: sources.length,
-      degraded: !LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
+      degraded: (!LLM_API_KEY && !usedLocal) || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
       points: (data.highpoints||[]).map(h=>({tag:h.tag,text:h.text})).slice(0,5),
       sections: (data.sections||[]).map(s=>s.title),
     },null,2),'utf-8');
