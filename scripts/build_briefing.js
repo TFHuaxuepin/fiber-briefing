@@ -585,7 +585,19 @@ async function main(){
     data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
+  // 防止「降级版覆盖完整版」（2026-09-23 事故）：
+  // 若本次产出为降级内容（LLM 整合失败 / 无文章 / 未配置 Key），而站点上已存在同日简报，
+  // 则直接判失败并保留既有完整版，绝不覆盖。workflow 的「失败告警」步骤会推送原因。
+  // 首次运行（当日文件尚不存在）仍按原设计降级发布，不影响「宁可降级也不缺稿」的取舍。
+  const degraded = !LLM_API_KEY || selected.length===0
+    || String(data.notes||'').includes('智能整合失败')
+    || String(data.notes||'').includes('未配置');
   fs.mkdirSync(SITE_DIR,{recursive:true});
+  const targetFile = path.join(SITE_DIR, `${dateStr}.html`);
+  if(degraded && fs.existsSync(targetFile)){
+    throw new Error(`本次为降级内容（${String(data.notes||'').slice(0,120)}），已存在 ${dateStr} 的完整版简报，跳过发布以免覆盖。`);
+  }
+
   const sources=selected.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
   fs.writeFileSync(path.join(SITE_DIR,`${dateStr}.html`), renderDaily(dateStr,rangeStr,data,sources),'utf-8');
   const briefings=fs.readdirSync(SITE_DIR).filter(f=>/^\d{4}-\d{2}-\d{2}\.html$/.test(f)).map(f=>({file:f,date:f.replace('.html','')})).sort((a,b)=>b.date.localeCompare(a.date));
