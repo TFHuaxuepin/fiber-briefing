@@ -65,10 +65,22 @@ jobs:
         with:
           node-version: '20'
 
+      # 休刊日闸门（2026-09-24 上线）：命中 config/off_days.json 的日期 → SKIP_TODAY=1，
+      # 后续构建、发布、推送全部跳过。长假（中秋/国庆）里 CCF 停更、Cookie 过期、
+      # LLM 配额受限，照常运行只会产出低质量降级版——宁可休刊，不发烂稿。
+      # 手动 repush 补推不受此限（假期里可用它补发最后一期完整简报）。
+      - name: Holiday guard (休刊日检查)
+        if: ${{ !inputs.repush }}
+        run: node scripts/off_day_guard.js
+        env:
+          TZ: Asia/Shanghai
+
       - name: Install dependencies
+        if: ${{ env.SKIP_TODAY != '1' }}
         run: npm install
 
       - name: Checkout gh-pages history
+        if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
         uses: actions/checkout@v4
         with:
           ref: gh-pages
@@ -76,13 +88,13 @@ jobs:
         continue-on-error: true
 
       - name: Build daily briefing (采集 + DeepSeek 整合)
-        if: ${{ !inputs.repush }}
+        if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
         run: node scripts/build_briefing.js
         env:
           TZ: Asia/Shanghai
 
       - name: Deploy to GitHub Pages
-        if: ${{ !inputs.repush }}
+        if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -100,11 +112,12 @@ jobs:
           TZ: Asia/Shanghai
 
       - name: WeChat push via ServerChan (微信推送)
-        if: ${{ !inputs.skip_wechat }}
+        if: ${{ !inputs.skip_wechat && env.SKIP_TODAY != '1' }}
         run: node scripts/notify.js
         continue-on-error: true
 
       - name: DingTalk push (钉钉推送)
+        if: ${{ env.SKIP_TODAY != '1' }}
         run: node scripts/notify_dingtalk.js
         continue-on-error: true
 
