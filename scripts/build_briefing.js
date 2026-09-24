@@ -619,18 +619,23 @@ async function main(){
     data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
-  // 防止「降级版覆盖完整版」（2026-09-23 事故）：
-  // 若本次产出为降级内容（LLM 整合失败 / 无文章 / 未配置 Key），而站点上已存在同日简报，
-  // 则直接判失败并保留既有完整版，绝不覆盖。workflow 的「失败告警」步骤会推送原因。
-  // 首次运行（当日文件尚不存在）仍按原设计降级发布，不影响「宁可降级也不缺稿」的取舍。
+  // 降级内容一律不发布（2026-09-24 策略升级：由「宁可降级也不缺稿」改为「宁可缺稿、不发烂稿」）：
+  //   · 已存在同日完整版 → 不覆盖（2026-09-23 事故的原始保护，保持不变）
+  //   · 当日尚无完整版 → 也不再发降级版：LLM 配额受限期间降级＝纯标题堆砌，
+  //     推到微信/钉钉就是低质量简报（长假场景的核心泄漏口，已由休刊日闸门 + 此处双保险）
+  // 两种情况都判失败，workflow 的「失败告警」步骤会把原因推到微信，用户知情。
   // 注意：本地生成内容（usedLocal）不属于降级——配额受限期它就是正常产出路径
   const degraded = (!LLM_API_KEY && !usedLocal) || selected.length===0
     || String(data.notes||'').includes('智能整合失败')
     || String(data.notes||'').includes('未配置');
   fs.mkdirSync(SITE_DIR,{recursive:true});
   const targetFile = path.join(SITE_DIR, `${dateStr}.html`);
-  if(degraded && fs.existsSync(targetFile)){
-    throw new Error(`本次为降级内容（${String(data.notes||'').slice(0,120)}），已存在 ${dateStr} 的完整版简报，跳过发布以免覆盖。`);
+  if(degraded){
+    const reason = String(data.notes||'').slice(0,120);
+    if(fs.existsSync(targetFile)){
+      throw new Error(`本次为降级内容（${reason}），已存在 ${dateStr} 的完整版简报，跳过发布以免覆盖。`);
+    }
+    throw new Error(`本次为降级内容且今日尚无完整版，按「宁可缺稿、不发烂稿」策略跳过发布（${reason}）。`);
   }
 
   const sources=selected.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
