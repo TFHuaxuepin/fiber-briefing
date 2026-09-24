@@ -546,7 +546,19 @@ async function main(){
   }
   if(enriched.length===0 && CCF_USER && CCF_PASS){
     console.log('使用 CCF 网页源采集...');
-    enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
+    try{
+      enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
+    }catch(e){
+      // Cookie 失效 / 网络不通 / 非报备 IP 被静默拒绝，都会走到这里。
+      // 若本地已生成当日内容(data/<日期>.json)，采集失败只影响页尾来源表，不阻断发布；
+      // 否则按「内容闸门」静默跳过——不发布、不推送、不告警（2026-09-24 网络/内容驱动闸门）。
+      if(fs.existsSync(path.join(DATA_DIR,`${dateStr}.json`))){
+        console.log(`[采集失败但存在本地内容] 继续构建，页尾来源表将不全（${e.message}）`);
+      }else{
+        console.log(`[SKIP] 采集失败且无本地内容，静默跳过本次构建：${e.message}`);
+        return;
+      }
+    }
   }else if(enriched.length===0){
     console.log('未配置 CCF_USERNAME/CCF_PASSWORD，无数据源');
   }
@@ -554,6 +566,17 @@ async function main(){
 
   // 只选时间窗内的新文章；若一篇都没有，退回使用列表中最新的若干篇
   let selected=enriched.filter(a=>isFresh(a,now));
+  // 节后兜底（2026-09-24）：长假跨度过大时，日报/速递的 72h 窗口会把假期前最后一个
+  // 交易日的数据整批滤掉（如 9/28 上班时 9/24 数据版已出窗、10/7 上班时 9/30 数据版出窗）
+  // → 「下游需求」板块断粮。此时对日报/速递（windowHours>24）单独放宽到 168h，
+  // 快讯窗口不动（超过 24h 的旧快讯没有引用价值）。
+  if(enriched.length>0 && !selected.some(a=>(a.windowHours||24)>24)){
+    const widened=enriched.filter(a=>(a.windowHours||24)>24 && isFresh({...a,windowHours:168},now));
+    if(widened.length>0){
+      selected=selected.concat(widened);
+      console.log(`[窗口放宽] 72h 内无日报/速递（长假刚过），放宽到 168h 补入 ${widened.length} 篇`);
+    }
+  }
   let usingFallback=false;
   if(selected.length===0 && enriched.length>0){
     selected=enriched.slice(0,10);
@@ -581,7 +604,9 @@ async function main(){
   let data;
   let usedLocal=false;
   const localJsonFile=path.join(DATA_DIR,`${dateStr}.json`);
-  if(selected.length>0 && fs.existsSync(localJsonFile)){
+  // 注意：不再要求 selected.length>0——即使云端采集全挂（cookie 失效等），
+  // 只要有本地生成的内容就照常发布（2026-09-24 网络/内容驱动闸门）。
+  if(fs.existsSync(localJsonFile)){
     const raw=fs.readFileSync(localJsonFile,'utf-8');
     const q=qualityCheck(raw);
     if(q.ok){
@@ -619,24 +644,22 @@ async function main(){
     data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
-  // 降级内容一律不发布（2026-09-24 策略升级：由「宁可降级也不缺稿」改为「宁可缺稿、不发烂稿」）：
-  //   · 已存在同日完整版 → 不覆盖（2026-09-23 事故的原始保护，保持不变）
-  //   · 当日尚无完整版 → 也不再发降级版：LLM 配额受限期间降级＝纯标题堆砌，
-  //     推到微信/钉钉就是低质量简报（长假场景的核心泄漏口，已由休刊日闸门 + 此处双保险）
-  // 两种情况都判失败，workflow 的「失败告警」步骤会把原因推到微信，用户知情。
-  // 注意：本地生成内容（usedLocal）不属于降级——配额受限期它就是正常产出路径
-  const degraded = (!LLM_API_KEY && !usedLocal) || selected.length===0
-    || String(data.notes||'').includes('智能整合失败')
-    || String(data.notes||'').includes('未配置');
-  fs.mkdirSync(SITE_DIR,{recursive:true});
-  const targetFile = path.join(SITE_DIR, `${dateStr}.html`);
+  // 发布闸门（2026-09-24 升级为「网络/内容驱动」，取代日期休刊表）：
+  //   · 本地生成内容（usedLocal）＝唯一常态产出路径，质量已过 qualityCheck → 必然发布
+  //   · 其余一切情形（无本地内容 / LLM 配额耗尽 / 素材为空 / Cookie 失效）→ 静默跳过：
+  //     不写页面、不写 notify.json（推送步骤自动无事可做）、不触发失败告警
+  //   「在不在办公网、cookie 续没续上」由本机采集链路自然判定，无需维护任何日期表
+  //   若日后 LLM 配额恢复，云端 LLM 产出非降级内容时同样可发布（自动回归，无需改码）
+  const degraded = !usedLocal && (
+      !LLM_API_KEY || selected.length===0
+      || String(data.notes||'').includes('智能整合失败')
+      || String(data.notes||'').includes('未配置'));
   if(degraded){
-    const reason = String(data.notes||'').slice(0,120);
-    if(fs.existsSync(targetFile)){
-      throw new Error(`本次为降级内容（${reason}），已存在 ${dateStr} 的完整版简报，跳过发布以免覆盖。`);
-    }
-    throw new Error(`本次为降级内容且今日尚无完整版，按「宁可缺稿、不发烂稿」策略跳过发布（${reason}）。`);
+    const reason=String(data.notes||'').slice(0,160) || (selected.length===0?'当日无可发布素材':'LLM 整合不可用');
+    console.log(`[SKIP] 今日不具备发布条件（按「宁可缺稿、不发烂稿」静默跳过，不推送不告警）：${reason}`);
+    return;
   }
+  fs.mkdirSync(SITE_DIR,{recursive:true});
 
   const sources=selected.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
   fs.writeFileSync(path.join(SITE_DIR,`${dateStr}.html`), renderDaily(dateStr,rangeStr,data,sources),'utf-8');
@@ -648,7 +671,7 @@ async function main(){
   try{
     fs.writeFileSync(path.join(__dirname,'..','notify.json'), JSON.stringify({
       date: dateStr, range: rangeStr, sources: sources.length,
-      degraded: (!LLM_API_KEY && !usedLocal) || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
+      degraded: !usedLocal && (!LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置')),
       points: (data.highpoints||[]).map(h=>({tag:h.tag,text:h.text})).slice(0,5),
       sections: (data.sections||[]).map(s=>s.title),
     },null,2),'utf-8');
