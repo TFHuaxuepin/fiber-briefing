@@ -19,6 +19,15 @@ const COLUMNS = [
   { id: '340000', name: '市场速递', windowHours: 72, maxArticles: 5 },
 ];
 
+// 节后兜底（2026-09-28 修正）：长假（中秋/国庆/春节）会让日报/速递的 72h 窗口把假期前
+// 最后一个交易日的数据整批滤掉（例：9/28 上班时 9/24 数据版已出窗、10/7 上班时 9/30 出窗）。
+// 而下游数据（涤丝产销、轻纺城面料成交量、DTY-POY 加工差、人棉坯布价）只存在于日报正文，
+// 一旦断粮，简报必需的「下游需求：加弹/织造/坯布」板块就无内容可写。
+// 故：当 windowHours>24 的栏目在自身窗口内一篇都没有时，自动放宽到 WIDEN_HOURS 再取一次，
+// 且只取最新 WIDEN_MAX 篇（避免整批旧文淹没当日素材）。快讯（24h）不参与，旧快讯无引用价值。
+const WIDEN_HOURS = 168;
+const WIDEN_MAX = 8;
+
 const BASE = 'https://huarui.ccf.com.cn';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -361,10 +370,16 @@ async function fetchCCFArticles(username, password) {
     try { arts = await fetchList(cookies, col.id, col.name); }
     catch (e) { console.error(`    [CCF] ${col.name} 列表失败: ${e.message}`); }
 
+    const winFilter = h => {
+      const from = bjDateStr(new Date(now.getTime() - h * 3600 * 1000));
+      const to = bjDateStr(now);
+      return arts.filter(a => { const d = (a.datetime || '').slice(0, 10); return d >= from && d <= to; });
+    };
     const from = bjDateStr(new Date(now.getTime() - col.windowHours * 3600 * 1000));
     const to = bjDateStr(now);
-    const inWindow = arts.filter(a => { const d = (a.datetime || '').slice(0, 10); return d >= from && d <= to; });
+    const inWindow = winFilter(col.windowHours);
     let picked = inWindow.slice(0, col.maxArticles);
+    let effWindow = col.windowHours;
     console.log(`    -> 列表 ${arts.length} 篇，窗口内 ${inWindow.length} 篇，采用 ${picked.length} 篇`);
     // 窗口内为 0 是异常信号：多半是列表页被 CDN 缓存成旧快照（常见于会话失效时），
     // 打印列表里的日期分布，便于一眼判断是「站点真没更新」还是「拿到旧页面」。
@@ -373,10 +388,21 @@ async function fetchCCFArticles(username, password) {
       console.log(`    [警告] ${col.name} 列表无窗口内文章（窗口 ${from} ~ ${to}），列表内日期：${dates.join(', ')}`);
     }
 
+    // 节后兜底：日报/速递在 72h 内为空（长假刚过）→ 放宽到 168h 补入假期前最后一个交易日的数据
+    if (picked.length === 0 && col.windowHours > 24 && arts.length > 0) {
+      const widened = winFilter(WIDEN_HOURS).slice(0, WIDEN_MAX);
+      if (widened.length > 0) {
+        const wDates = [...new Set(widened.map(a => (a.datetime || '?').slice(0, 10)))].sort();
+        console.log(`    [窗口放宽] ${col.name} ${col.windowHours}h 内无内容（长假刚过），放宽到 ${WIDEN_HOURS}h 补入 ${widened.length} 篇：${wDates.join(', ')}`);
+        picked = widened;
+        effWindow = WIDEN_HOURS;
+      }
+    }
+
     for (const a of picked) {
       if (seen.has(a.url)) continue;
       seen.add(a.url);
-      a.windowHours = col.windowHours;   // 供下游做时间窗判断
+      a.windowHours = effWindow;   // 供下游做时间窗判断
       all.push(a);
     }
   }
