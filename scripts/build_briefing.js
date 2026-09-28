@@ -39,11 +39,16 @@ function parseBeijing(datetime) { const m = datetime.match(/^(\d{4})-(\d{2})-(\d
 // 时间窗判断：不同栏目回溯窗口不同（快讯 24h，日报/市场速递 72h 以覆盖周末），
 // 统一用「北京墙上钟字符串」比较，避免时区换算误差把日报整批滤掉。
 function windowStart(now, hours){ return beijingStr(new Date(now.getTime() - hours*60*60*1000)).slice(0,16); }
+// 列表页解析不到钟点时统一兜底为当天 09:00（见 ccf.js parseListHtml）。若本机在 09:00 之前跑，
+// 这些当日条目会被 d<=end 误判成「未来」而整批丢弃——2026-09-28 实测：08:43 跑时当天的全部快讯
+// 与市场速递（共 6 篇，含「早盘概览」「桐乡大厂涤丝报价」）全部落选，简报只剩假期前的日报。
+// 故给上界加一个向前的容差，只影响「当天」这一档：站点不可能发布未来内容，放进来仍是当日素材。
+const FRESH_FUTURE_TOL_MS = 3 * 60 * 60 * 1000;
 function isFresh(a, now){
   const d=String(a.datetime||'').slice(0,16);
   if(!d) return false;
   const start=windowStart(now, a.windowHours||24);
-  const end=beijingStr(now).slice(0,16);
+  const end=beijingStr(new Date(now.getTime() + FRESH_FUTURE_TOL_MS)).slice(0,16);
   return d>=start && d<=end;
 }
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
