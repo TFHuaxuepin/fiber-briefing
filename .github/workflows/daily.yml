@@ -132,9 +132,37 @@ jobs:
         run: node scripts/notify.js
         continue-on-error: true
 
-      - name: DingTalk push (钉钉推送)
+      # 钉钉幂等守护（2026-10-07）：钉钉由云端 09:00 定时任务负责推送（本地流程只推微信），
+      # 若当天已被更早的运行推过（例如 09:00 延迟、先用 repush 补过），定时任务不应再推一次到群。
+      # 状态记录在主分支 state/dingtalk_last.txt（内容＝最后成功推送的日期）。
+      # 与微信同理：只在 schedule 事件生效，手动 dispatch / repush 不受限（手动＝明确要发）。
+      - name: Check DingTalk already sent (钉钉幂等检查)
+        id: dt
         if: ${{ env.SKIP_TODAY != '1' }}
+        run: |
+          D=$(TZ=Asia/Shanghai date +%F)
+          LAST=""
+          if [ -f "state/dingtalk_last.txt" ]; then LAST=$(tr -d ' \r\n' < state/dingtalk_last.txt); fi
+          echo "last=[$LAST] today=[$D]"
+          if [ "$LAST" = "$D" ]; then echo "sent=yes" >> "$GITHUB_OUTPUT"; else echo "sent=no" >> "$GITHUB_OUTPUT"; fi
+
+      - name: DingTalk push (钉钉推送)
+        id: dingtalk
+        if: ${{ env.SKIP_TODAY != '1' && (github.event_name != 'schedule' || steps.dt.outputs.sent != 'yes') }}
         run: node scripts/notify_dingtalk.js
+        continue-on-error: true
+
+      # 记录钉钉已推（供后续 schedule run 判重）；仅当确实执行且未被 SKIP_DINGTALK 测试开关跳过时记录
+      - name: Mark DingTalk sent (记录钉钉已推)
+        if: ${{ env.SKIP_TODAY != '1' && env.SKIP_DINGTALK != '1' && steps.dingtalk.outcome == 'success' }}
+        run: |
+          D=$(TZ=Asia/Shanghai date +%F)
+          mkdir -p state
+          echo "$D" > state/dingtalk_last.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/dingtalk_last.txt
+          if git diff --cached --quiet; then echo "state unchanged"; else git commit -m "chore(state): dingtalk sent $D"; git push; fi
         continue-on-error: true
 
       # 失败告警：前面任一步骤失败时推一条微信，避免「早上没收到简报却没人知道」
