@@ -79,13 +79,27 @@ jobs:
         if: ${{ env.SKIP_TODAY != '1' }}
         run: npm install
 
+      # 补推模式也必须拉 gh-pages：notify_from_site.js 要从 site/<date>.html 反推推送内容
+      # （2026-10-07 修复：此前该步骤在 repush 下被跳过，导致补推恒失败「找不到当日页面」）
       - name: Checkout gh-pages history
-        if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
+        if: ${{ env.SKIP_TODAY != '1' }}
         uses: actions/checkout@v4
         with:
           ref: gh-pages
           path: site
         continue-on-error: true
+
+      # 推送幂等守护（2026-10-07）：本次运行「开始前」今天的页面若已存在，
+      # 说明当天的发布与微信推送已由更早的运行（本地 08:40 总结流程那次 dispatch）完成。
+      # 此时定时任务只做补位：若今日尚无页面则正常构建+推送；已有则跳过微信推送，避免重复打扰。
+      # 手动 dispatch 不受此限（手动重跑通常就是要重发），repush 补推更是明确要发。
+      - name: Check if today already published (推送幂等检查)
+        id: pub
+        if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
+        run: |
+          D=$(TZ=Asia/Shanghai date +%F)
+          if [ -f "site/$D.html" ]; then echo "already=yes"; else echo "already=no"; fi
+          if [ -f "site/$D.html" ]; then echo "already=yes" >> "$GITHUB_OUTPUT"; else echo "already=no" >> "$GITHUB_OUTPUT"; fi
 
       - name: Build daily briefing (采集 + DeepSeek 整合)
         if: ${{ !inputs.repush && env.SKIP_TODAY != '1' }}
@@ -111,8 +125,10 @@ jobs:
         env:
           TZ: Asia/Shanghai
 
+      # 定时任务（schedule）只在「今日页面此前尚未发布」时推送微信，避免与本地流程的推送重复；
+      # 手动 dispatch / repush 一律照常推送
       - name: WeChat push via ServerChan (微信推送)
-        if: ${{ !inputs.skip_wechat && env.SKIP_TODAY != '1' }}
+        if: ${{ !inputs.skip_wechat && env.SKIP_TODAY != '1' && (github.event_name != 'schedule' || steps.pub.outputs.already != 'yes') }}
         run: node scripts/notify.js
         continue-on-error: true
 
