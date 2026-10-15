@@ -1,7 +1,7 @@
 {
   "name": "fiber-briefing",
   "version": "1.0.0",
-  "description": "化纤行业微信公众号每日信息简报 - GitHub Actions 云端定时生成并发布",
+  "description": "化纤行业每日信息简报 - 本机生成内容（本机LLM），云端 Actions 只渲染页面并推送",
   "private": true,
   "scripts": {
     "build": "node scripts/build_briefing.js"

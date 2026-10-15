@@ -1,14 +1,22 @@
-# 化纤行业每日信息简报（云端自动版）
+# 化纤行业每日信息简报
 
-每天北京时间 09:00 由 GitHub Actions 自动运行，**无需本机开机**，登录华瑞信息 CCF 化纤信息网采集当日快讯正文，调用大模型整合为分析师风格信息简报，并发布到 GitHub Pages。
+每日北京时间 08:40 由**本机** WorkBuddy 流程登录华瑞信息 CCF 化纤信息网采集当日快讯正文，由**本机大模型**整合为分析师风格简报（落地为 `data/<日期>.json`），随后外送 GitHub；云端 Actions 只负责**渲染页面 + 发布 GitHub Pages + 推微信/钉钉**，**不产简报内容**。
+
+> ⚠️ **架构要点（2026-10-15 定论）**：**简报由本机生成，云端不产内容**。
+> 云端 LLM（联通云 `deepseek-v4-pro`）已失效（`Model is disabled`），旧「云端采集+云端整合」方案**已废弃**；`data/<日期>.json` 是**唯一产路**，由本机当天产出。
 
 ## 工作原理
 
-1. GitHub Actions 按计划触发（cron `0 1 * * *` UTC = 北京 09:00）
-2. 用 CCF 会员账号登录 `huarui.ccf.com.cn`，获取会话 cookie
-3. 抓取「CCF 快讯」当日列表，逐篇抓取正文（GBK 解码，内置 429/5xx 退避重试）
-4. 调用大模型（默认联通云 `deepseek-v4-pro`），把当日快讯交叉整合为带数据、表格、判断的行业简报
-5. 生成当日 HTML + 历史目录页，自动发布到 GitHub Pages
+**本机段（每日 08:40，WorkBuddy 自动化）**
+1. 登录 `huarui.ccf.com.cn`（仅办公室报备网可登），续期 Cookie
+2. 抓取「CCF 快讯 / 日报 / 市场速递」，逐篇取正文（GBK 解码，内置 429/5xx 退避重试）
+3. 本机大模型交叉整合 → 写 `data/<日期>.json`（highpoints/sections/notes）
+4. 经 GitHub Contents API 把 `data/<日期>.json` 外送到仓库
+
+**云端段（GitHub Actions）**
+5. Actions 触发后，检测到当日 `data/<日期>.json` 存在 ⇒ **直接渲染**（日志 `[LOCAL] 采用本地生成内容`），不再调用任何 LLM
+6. 生成当日 HTML + 历史目录页，发布到 GitHub Pages
+7. 推微信（Server酱）+ 推钉钉（按配置）
 
 ## 必须配置的仓库 Secrets（Settings → Secrets and variables → Actions）
 
@@ -16,16 +24,14 @@
 |---|---|---|
 | `CCF_USERNAME` | CCF 会员账号 | **必填**，华瑞信息网登录账号 |
 | `CCF_PASSWORD` | CCF 会员密码 | **必填** |
-| `LLM_API_KEY` | 大模型 API Key | 必填，用于智能整合 |
-| `LLM_BASE_URL` | `https://token.chinaunicomglobal.com` | 选填，默认即此值 |
-| `LLM_MODEL` | `deepseek-v4-pro` | 选填，默认即此值 |
+| `CCF_COOKIE` | CCF 会话 Cookie | **必填**（云端自采拿 sources 用；由本机续期任务写回，寿命 <24h） |
 | `SERVERCHAN_KEY` | Server酱 SendKey | 选填，配置后推送微信通知 |
 | `DINGTALK_WEBHOOK` | 钉钉群机器人 Webhook | 选填，配置后推送钉钉群 |
 | `DINGTALK_SECRET` | 钉钉机器人加签密钥 | 选填，安全设置选「加签」时必填 |
 | `DINGTALK_AT_MOBILES` | 要 @ 的手机号，逗号分隔 | 选填 |
 | `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET` / `DINGTALK_ROBOT_CODE` / `DINGTALK_USER_IDS` | 企业内部应用机器人凭据 | 选填，用于**私聊推给指定的人** |
 
-不配置 `LLM_API_KEY` 时脚本会降级为标题列表，不会报错。
+> 注：`LLM_API_KEY` 属**旧云端方案遗留，已不再使用**（云端 LLM 已失效）；云端遇到降级内容会被发布闸门拦下，不再发布降级版。
 
 ## 钉钉推送
 
@@ -64,16 +70,18 @@ Actions 页面 → Daily Fiber Briefing → Run workflow
 
 ```
 scripts/
-  ccf.js              CCF 采集模块（登录 / 列表 / 正文）
-  build_briefing.js   主流程（采集 → 整合 → 渲染 HTML）
-  notify.js           Server酱微信推送
-  notify_dingtalk.js  钉钉推送（群机器人 / 企业机器人单聊）
+  ccf.js                  CCF 采集模块（登录 / 列表 / 正文）
+  build_briefing.js       主流程（采集 → 整合 → 渲染 HTML）
+  sync_signals_local.py   本机信号写卡（纯本地：读 data/ → 写知识库卡片，零 LLM/网络）
+  notify.js               Server酱微信推送
+  notify_dingtalk.js      钉钉推送（群机器人 / 企业机器人单聊）
+auto-sync-card.bat        本机信号写卡入口（调 sync_signals_local.py）
 .github/workflows/
-  daily.yml           定时任务定义
+  daily.yml               云端定时任务定义（渲染 + 发布 + 推送）
 ```
 
 ## 注意事项
 
-- CCF 网页对高频请求有限流，脚本已内置重试；若持续 429 会自动降级
+- CCF 网页对高频请求有限流，脚本已内置重试
 - 文章正文为会员内容，仅用于内部参考，请勿外传
-- 大模型调用约每日几分钱，用量极低
+- **简报内容由本机生成**（本机大模型），云端不调用任何 LLM，故无云端大模型费用
