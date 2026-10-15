@@ -13,9 +13,14 @@ const CCF_USER = process.env.CCF_USERNAME || '';
 const CCF_PASS = process.env.CCF_PASSWORD || '';
 const DATA_SOURCE = CCF_USER ? '华瑞CCF化纤信息网' : '无（请配置CCF_USERNAME/CCF_PASSWORD）';
 const SITE_DIR = path.join(__dirname, '..', 'site');
-const NODE_MODULES = 'C:/Users/24428/.workbuddy/binaries/node/workspace/node_modules';
+// 本地 AI 模式（2026-09-23 起）：外部 LLM 配额受限时，改由本机 WorkBuddy 生成简报内容。
+// 约定：<repo>/data/<日期>.json 存放本地生成的内容结构（highpoints/sections/notes）；
+//      该文件存在即优先使用、跳过 callLLM；配额恢复后不再生成该文件即自动回到云端 LLM。
+// AGENT_MODE=prepare：只做采集并把提示词导出到 data/<日期>.prompt.txt，供本机生成内容，不调用任何 LLM。
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const AGENT_MODE = process.env.AGENT_MODE || '';
 let cheerio = null;
-try { cheerio = require(path.join(NODE_MODULES, 'cheerio')); } catch { try { cheerio = require('cheerio'); } catch {} }
+try { cheerio = require('cheerio'); } catch {}
 
 const LLM_API_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || '';
 const LLM_BASE = process.env.LLM_BASE_URL || 'https://token.chinaunicomglobal.com';
@@ -34,11 +39,16 @@ function parseBeijing(datetime) { const m = datetime.match(/^(\d{4})-(\d{2})-(\d
 // 时间窗判断：不同栏目回溯窗口不同（快讯 24h，日报/市场速递 72h 以覆盖周末），
 // 统一用「北京墙上钟字符串」比较，避免时区换算误差把日报整批滤掉。
 function windowStart(now, hours){ return beijingStr(new Date(now.getTime() - hours*60*60*1000)).slice(0,16); }
+// 列表页解析不到钟点时统一兜底为当天 09:00（见 ccf.js parseListHtml）。若本机在 09:00 之前跑，
+// 这些当日条目会被 d<=end 误判成「未来」而整批丢弃——2026-09-28 实测：08:43 跑时当天的全部快讯
+// 与市场速递（共 6 篇，含「早盘概览」「桐乡大厂涤丝报价」）全部落选，简报只剩假期前的日报。
+// 故给上界加一个向前的容差，只影响「当天」这一档：站点不可能发布未来内容，放进来仍是当日素材。
+const FRESH_FUTURE_TOL_MS = 3 * 60 * 60 * 1000;
 function isFresh(a, now){
   const d=String(a.datetime||'').slice(0,16);
   if(!d) return false;
   const start=windowStart(now, a.windowHours||24);
-  const end=beijingStr(now).slice(0,16);
+  const end=beijingStr(new Date(now.getTime() + FRESH_FUTURE_TOL_MS)).slice(0,16);
   return d>=start && d<=end;
 }
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -231,9 +241,11 @@ function llmEndpoints(){
   // 否则先试 /v1/chat/completions（多数网关），再回退 /chat/completions（DeepSeek 原生）
   return [base+'/v1/chat/completions', base+'/chat/completions'];
 }
-// 模型候选：默认模型优先，其次环境变量指定的模型（去重）
+// 模型候选：环境变量指定的模型优先（用户显式配置即以此为准），
+// 未配置时才回退到默认 deepseek-v4-pro（2026-10-13：v4-pro 被网关禁用，
+// 硬编码置顶会导致配置的备选模型永远轮不到）。
 function llmModels(){
-  return [...new Set(['deepseek-v4-pro', LLM_MODEL].filter(Boolean))];
+  return [...new Set([LLM_MODEL, 'deepseek-v4-pro'].filter(Boolean))];
 }
 function postJSON(url, body){
   return new Promise((resolve,reject)=>{
@@ -298,7 +310,10 @@ async function callLLM(prompt){
           lastErr=`HTTP ${r.status}: ${r.raw.slice(0,200)}`;
           console.log(`  (HTTP ${r.status}: ${model}/${jsonMode?'json':'text'} @ ${url.replace(/^https?:\/\//,'')})`);
           if(r.status===404){ deadUrls.add(url); break; }      // 端点不存在 → 本轮起跳过该端点
-          if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ break; }
+          // 某模型不可用（禁用/不存在）→ 仅把「当前模型」拉黑并换下一个候选模型，
+          // 不能再 break 整个模型循环（2026-10-13 事故：deepseek-v4-pro 被网关禁用时，
+          // 这里的 break 会让 LLM_MODEL 备选模型也一并被跳过，导致无模型可试、直接降级）。
+          if(/model is disabled|model not found|无此模型|模型.*(禁用|不存在)/i.test(r.raw)){ deadModels.add(model); break; }
           // 401/403 不再把模型永久拉黑（2026-09-17：网关偶发对可用模型返回 401 Model is disabled，
           // 数分钟后同一模型又恢复正常；拉黑会导致后续轮次无模型可用）。轮数上限已控制总耗时。
           if(r.status===401||r.status===403){ continue; }
@@ -541,7 +556,19 @@ async function main(){
   }
   if(enriched.length===0 && CCF_USER && CCF_PASS){
     console.log('使用 CCF 网页源采集...');
-    enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
+    try{
+      enriched=await fetchCCFArticles(CCF_USER, CCF_PASS);
+    }catch(e){
+      // Cookie 失效 / 网络不通 / 非报备 IP 被静默拒绝，都会走到这里。
+      // 若本地已生成当日内容(data/<日期>.json)，采集失败只影响页尾来源表，不阻断发布；
+      // 否则按「内容闸门」静默跳过——不发布、不推送、不告警（2026-09-24 网络/内容驱动闸门）。
+      if(fs.existsSync(path.join(DATA_DIR,`${dateStr}.json`))){
+        console.log(`[采集失败但存在本地内容] 继续构建，页尾来源表将不全（${e.message}）`);
+      }else{
+        console.log(`[SKIP] 采集失败且无本地内容，静默跳过本次构建：${e.message}`);
+        return;
+      }
+    }
   }else if(enriched.length===0){
     console.log('未配置 CCF_USERNAME/CCF_PASSWORD，无数据源');
   }
@@ -549,6 +576,17 @@ async function main(){
 
   // 只选时间窗内的新文章；若一篇都没有，退回使用列表中最新的若干篇
   let selected=enriched.filter(a=>isFresh(a,now));
+  // 节后兜底（2026-09-24）：长假跨度过大时，日报/速递的 72h 窗口会把假期前最后一个
+  // 交易日的数据整批滤掉（如 9/28 上班时 9/24 数据版已出窗、10/7 上班时 9/30 数据版出窗）
+  // → 「下游需求」板块断粮。此时对日报/速递（windowHours>24）单独放宽到 168h，
+  // 快讯窗口不动（超过 24h 的旧快讯没有引用价值）。
+  if(enriched.length>0 && !selected.some(a=>(a.windowHours||24)>24)){
+    const widened=enriched.filter(a=>(a.windowHours||24)>24 && isFresh({...a,windowHours:168},now));
+    if(widened.length>0){
+      selected=selected.concat(widened);
+      console.log(`[窗口放宽] 72h 内无日报/速递（长假刚过），放宽到 168h 补入 ${widened.length} 篇`);
+    }
+  }
   let usingFallback=false;
   if(selected.length===0 && enriched.length>0){
     selected=enriched.slice(0,10);
@@ -559,8 +597,38 @@ async function main(){
 
   try{ fs.writeFileSync(path.join(__dirname,'..','debug_last.json'), JSON.stringify(enriched,null,2),'utf-8'); }catch{}
 
+  // 模式一：只采集并导出提示词，交给本机 WorkBuddy 生成内容（不调用任何 LLM）
+  if(AGENT_MODE==='prepare'){
+    if(selected.length===0) console.log('[AGENT] 警告：当日窗口内 0 篇文章，导出的提示词将不含素材');
+    const prompt=buildLLMPrompt(selected,dateStr,rangeStr);
+    fs.mkdirSync(DATA_DIR,{recursive:true});
+    const promptFile=path.join(DATA_DIR,`${dateStr}.prompt.txt`);
+    fs.writeFileSync(promptFile,prompt,'utf-8');
+    console.log(`[AGENT] 提示词已导出（${prompt.length} 字符）：${promptFile}`);
+    console.log(`[AGENT] 下一步：据此生成 data/${dateStr}.json，然后不带 AGENT_MODE 重新运行本脚本`);
+    return;
+  }
+
+  // 模式二：若本地已生成当日内容（data/<日期>.json），优先采用，跳过 callLLM。
+  // 这是「配额受限时由本机出内容、云端只负责渲染与推送」的核心开关。
   let data;
-  if(LLM_API_KEY && selected.length>0){
+  let usedLocal=false;
+  const localJsonFile=path.join(DATA_DIR,`${dateStr}.json`);
+  // 注意：不再要求 selected.length>0——即使云端采集全挂（cookie 失效等），
+  // 只要有本地生成的内容就照常发布（2026-09-24 网络/内容驱动闸门）。
+  if(fs.existsSync(localJsonFile)){
+    const raw=fs.readFileSync(localJsonFile,'utf-8');
+    const q=qualityCheck(raw);
+    if(q.ok){
+      data=sanitizeData(safeParseJSON(raw));
+      usedLocal=true;
+      console.log(`[LOCAL] 采用本地生成内容 ${localJsonFile}（要点 ${(data.highpoints||[]).length} 条，板块 ${(data.sections||[]).length} 个）`);
+    }else{
+      console.log(`[LOCAL] 本地内容不可用（${q.reason}），回退云端 LLM`);
+    }
+  }
+
+  if(!usedLocal && LLM_API_KEY && selected.length>0){
     console.log('调用大模型整合...');
     try{
       const resp=await callLLM(buildLLMPrompt(selected,dateStr,rangeStr));
@@ -581,12 +649,28 @@ async function main(){
       console.error('LLM 失败，降级为标题列表: '+e.message);
       data={ highpoints:[{tag:'提示',text:'本期智能整合失败，已降级为标题列表。'}], sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes:'智能整合失败，仅展示原文列表。原因：'+e.message };
     }
-  }else{
+  }else if(!usedLocal){
     console.log(LLM_API_KEY?('无可用文章（采集到 '+enriched.length+' 篇）'):'未配置 LLM_API_KEY');
     data={ highpoints:selected.slice(0,4).map(a=>({tag:'资讯',text:`${a.source}：${a.title}`})), sections:[{title:'标题列表',paragraphs:selected.map(a=>`${a.source}：${a.title}（${a.datetime}）`)}], notes: LLM_API_KEY?'本期未采集到文章，仅展示标题列表。':'未配置大模型 API，仅展示原文列表；配置 LLM_API_KEY 后将自动整合为内容简报。' };
   }
 
+  // 发布闸门（2026-09-24 升级为「网络/内容驱动」，取代日期休刊表）：
+  //   · 本地生成内容（usedLocal）＝唯一常态产出路径，质量已过 qualityCheck → 必然发布
+  //   · 其余一切情形（无本地内容 / LLM 配额耗尽 / 素材为空 / Cookie 失效）→ 静默跳过：
+  //     不写页面、不写 notify.json（推送步骤自动无事可做）、不触发失败告警
+  //   「在不在办公网、cookie 续没续上」由本机采集链路自然判定，无需维护任何日期表
+  //   若日后 LLM 配额恢复，云端 LLM 产出非降级内容时同样可发布（自动回归，无需改码）
+  const degraded = !usedLocal && (
+      !LLM_API_KEY || selected.length===0
+      || String(data.notes||'').includes('智能整合失败')
+      || String(data.notes||'').includes('未配置'));
+  if(degraded){
+    const reason=String(data.notes||'').slice(0,160) || (selected.length===0?'当日无可发布素材':'LLM 整合不可用');
+    console.log(`[SKIP] 今日不具备发布条件（按「宁可缺稿、不发烂稿」静默跳过，不推送不告警）：${reason}`);
+    return;
+  }
   fs.mkdirSync(SITE_DIR,{recursive:true});
+
   const sources=selected.map(a=>({source:a.source,title:a.title,datetime:a.datetime,url:a.url}));
   fs.writeFileSync(path.join(SITE_DIR,`${dateStr}.html`), renderDaily(dateStr,rangeStr,data,sources),'utf-8');
   const briefings=fs.readdirSync(SITE_DIR).filter(f=>/^\d{4}-\d{2}-\d{2}\.html$/.test(f)).map(f=>({file:f,date:f.replace('.html','')})).sort((a,b)=>b.date.localeCompare(a.date));
@@ -597,12 +681,25 @@ async function main(){
   try{
     fs.writeFileSync(path.join(__dirname,'..','notify.json'), JSON.stringify({
       date: dateStr, range: rangeStr, sources: sources.length,
-      degraded: !LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置'),
+      degraded: !usedLocal && (!LLM_API_KEY || selected.length===0 || String(data.notes||'').includes('智能整合失败') || String(data.notes||'').includes('未配置')),
       points: (data.highpoints||[]).map(h=>({tag:h.tag,text:h.text})).slice(0,5),
       sections: (data.sections||[]).map(s=>s.title),
     },null,2),'utf-8');
   }catch{}
 }
 
-if(require.main===module){ main().catch(e=>{ console.error('失败:',e); process.exit(1); }); }
+// 失败原因落盘：workflow 里「失败告警」是独立步骤，拿不到上一步的 stdout，
+// 用它把原因传给 notify_failure.js，让告警带上具体原因与处置建议。
+const FAIL_REASON_FILE = path.join(__dirname, '..', 'failure_reason.txt');
+function writeFailReason(msg) {
+  try { fs.writeFileSync(FAIL_REASON_FILE, String(msg || '').slice(0, 500), 'utf-8'); } catch {}
+}
+function clearFailReason() {
+  try { fs.unlinkSync(FAIL_REASON_FILE); } catch {}
+}
+
+if(require.main===module){
+  clearFailReason();
+  main().catch(e=>{ console.error('失败:',e); writeFailReason(e && e.message ? e.message : e); process.exit(1); });
+}
 module.exports={ callLLM, buildLLMPrompt, buildMaterials, excerpt, llmEndpoints, llmModels, renderDaily, sanitizeData, qualityCheck };

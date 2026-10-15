@@ -4,7 +4,20 @@ notify.json
 site/
 *.log
 
+# 抓取原始素材（含第三方页面文案/联系方式，不进公网）
+data/*.prompt.txt
+data/*.json.bak
+debug_last.json.bak
+
 cmdkey_out.txt
 
 _logs/
 pages_index.html
+
+# Local probes / CI logs / downloaded run artifacts (may contain credentials)
+_*.js
+_*.txt
+_*.zip
+_l*/
+last_run.txt
+test_parse.js

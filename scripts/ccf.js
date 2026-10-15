@@ -9,11 +9,24 @@ const iconv = require('iconv-lite');
 const querystring = require('querystring');
 
 // 栏目配置
-// 经实测：list-110000.shtml 是"全部"列表（约28篇），会同时返回快讯/评论/要闻等各栏目文章。
-// 为避免重复请求触发 429 限流，只保留一个主列表，用文章 URL 里的 colId 区分栏目。
+// 每个栏目都是独立列表页（list-<id>.shtml），需要单独请求。
+// windowHours：该栏目的时间回溯窗口。快讯为日频用 24h；日报/市场速递内容更结构化，但
+//   周末不更新、且列表页不给出精确时分（默认 09:00），故回溯 72h 以覆盖周五→周一。
+// maxArticles：该栏目最多抓多少篇正文，用于控制请求量与 429 风险。
 const COLUMNS = [
-  { id: '110000', name: 'CCF快讯', priority: 1 },
+  { id: '110000', name: 'CCF快讯',   windowHours: 24, maxArticles: 40 },
+  { id: '140000', name: 'CCF日报',   windowHours: 72, maxArticles: 24 },
+  { id: '340000', name: '市场速递', windowHours: 72, maxArticles: 5 },
 ];
+
+// 节后兜底（2026-09-28 修正）：长假（中秋/国庆/春节）会让日报/速递的 72h 窗口把假期前
+// 最后一个交易日的数据整批滤掉（例：9/28 上班时 9/24 数据版已出窗、10/7 上班时 9/30 出窗）。
+// 而下游数据（涤丝产销、轻纺城面料成交量、DTY-POY 加工差、人棉坯布价）只存在于日报正文，
+// 一旦断粮，简报必需的「下游需求：加弹/织造/坯布」板块就无内容可写。
+// 故：当 windowHours>24 的栏目在自身窗口内一篇都没有时，自动放宽到 WIDEN_HOURS 再取一次，
+// 且只取最新 WIDEN_MAX 篇（避免整批旧文淹没当日素材）。快讯（24h）不参与，旧快讯无引用价值。
+const WIDEN_HOURS = 168;
+const WIDEN_MAX = 8;
 
 const BASE = 'https://huarui.ccf.com.cn';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -94,49 +107,123 @@ function decodeGBK(buf, headers) {
 // ===== 登录 =====
 
 async function login(username, password) {
+  // 逃生通道：CCF_COOKIE 直接提供已登录的 Cookie 串（形如 "PHPSESSID=...; uid=...; values=...; identity=..."），
+  // 用于账号密码登录被目标站风控拦截时临时顶替。注意 PHPSESSID 服务端会话会过期，属临时方案。
+  const manual = (process.env.CCF_COOKIE || '').trim();
+  if (manual) {
+    console.log('[CCF] 使用人工提供的 CCF_COOKIE（跳过账号密码登录）');
+    loggedInCookies = manual;
+    return manual;
+  }
   if (!username || !password) throw new Error('需要 CCF_USERNAME 和 CCF_PASSWORD 环境变量');
   console.log('[CCF] 登录...');
-  let cookies = '';
 
-  // Step1: 获取 session
-  const s1 = await request({url: `${BASE}/`});
-  cookies = mergeCookies(cookies, s1.headers['set-cookie']);
+  // 登录偶发失败（服务端抖动 / 风控），重试 2 轮
+  const MAX_ATTEMPTS = 3;
+  let lastDiag = '';
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let cookies = '';
+    // 「错误位为空」＝凭据校验通过但服务端不下发会话（2026-09-19 定案：最常见原因是**
+    // 当前网络 IP 不在 CCF 报备的白名单里**，站点对此静默拒绝）。
+    // 这种失败重试 100 次也不会成功，且反复登录可能加剧风控 —— 一旦命中就直接放弃。
+    let noSessionReject = false;
+    try {
+      // Step1: 先访问「登录页」建立会话。
+      // 注意：2026-09-19 起 GET / 不再下发任何 Cookie（疑似 CDN/缓存策略变化），
+      // 若仍用首页预热，POST 会在「无会话」状态下发出，服务端直接原样重渲染登录页
+      // 并返回空错误提示（<font color="red"></font>），表现为「HTTP 200 但拿不到 uid」。
+      // 登录页 GET 稳定下发 PHPSESSID，因此改为以登录页预热；首页作为兜底。
+      const s1 = await request({url: `${BASE}/member/member.php`});
+      cookies = mergeCookies(cookies, s1.headers['set-cookie']);
+      if (!cookies) {
+        const s1b = await request({url: `${BASE}/`});
+        cookies = mergeCookies(cookies, s1b.headers['set-cookie']);
+        console.log(`[CCF] 登录页未下发会话 cookie，已用首页兜底（${cookies ? '已获取' : '仍为空'}）`);
+      }
 
-  // Step2: POST 登录
-  const body = querystring.stringify({
-    custlogin: '1',
-    action: 'login',
-    url: '/',
-    lng: '-1',
-    lat: '-1',
-    s: '',
-    username,
-    password,
-    savecookie: '1',
-    'imageField.x': '12',
-    'imageField.y': '8',
-  });
-  const s2 = await request({
-    url: `${BASE}/member/member.php`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Cookie': cookies,
-      'Origin': BASE,
-      'Referer': `${BASE}/`,
-    },
-    body,
-  });
-  cookies = mergeCookies(cookies, s2.headers['set-cookie']);
+      // Step2: POST 登录
+      const body = querystring.stringify({
+        custlogin: '1',
+        action: 'login',
+        url: '/',
+        lng: '-1',
+        lat: '-1',
+        s: '',
+        username,
+        password,
+        savecookie: '1',
+        'imageField.x': '12',
+        'imageField.y': '8',
+      });
+      const s2 = await request({
+        url: `${BASE}/member/member.php`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Cookie': cookies,
+          'Origin': BASE,
+          'Referer': `${BASE}/member/member.php`,
+        },
+        body,
+      });
+      cookies = mergeCookies(cookies, s2.headers['set-cookie']);
 
-  // 验证登录：检查是否有 uid cookie（非 0 值表示登录成功）
-  const uidMatch = cookies.match(/uid=([^;]+)/);
-  if (!uidMatch || uidMatch[1] === '0' || uidMatch[1] === '0%3D' || uidMatch[1].length < 10) {
-    throw new Error(`CCF 登录失败: 未获取到有效 uid cookie，请检查账号密码。cookie=${cookies.slice(0, 80)}`);
+      // 验证登录：检查是否有 uid cookie（非 0 值表示登录成功）
+      const uidMatch = cookies.match(/uid=([^;]+)/);
+      if (uidMatch && uidMatch[1] !== '0' && uidMatch[1] !== '0%3D' && uidMatch[1].length >= 10) {
+        console.log(attempt > 1 ? `[CCF] 登录成功（第 ${attempt} 次尝试）` : '[CCF] 登录成功');
+        loggedInCookies = cookies;
+        return cookies;
+      }
+
+      // 说明：uid cookie 是登录成功的**必要**判据。曾观察到「响应页面看似已登录、但没有 uid」
+      // 的情况，实测这种会话抓到的正文其实是「会员可见」的拦截页 —— 所以这里必须严格。
+      // 拦截页由 fetchContent 的 gate 检测兜底（双保险），避免产出只有标题的空简报。
+
+      // 失败：记录诊断信息，便于在 CI 日志里定位原因
+      let diag = '';
+      try {
+        const raw = decodeGBK(s2.body, s2.headers);
+        const text = raw
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        // 优先抽取与失败有关的片段
+        const kw = text.match(/.{0,60}(密码|验证码|错误|失败|不正确|锁定|冻结|异地|频繁|限制|验证).{0,80}/);
+        // 登录页模板把错误写进 <font color="red">…</font>：
+        //   有文案 = 凭据被拒（账号/密码问题）
+        //   空文案 = 凭据通过但服务端未下发会话（账号状态问题，如停用/到期/需验证），
+        //            这种情况不要反复重试登录，重试无用且可能触发风控（2026-09-19 实测）
+        const redBox = (raw.match(/<font color="red">([\s\S]*?)<\/font>/i) || [])[1];
+        const redMsg = redBox !== undefined ? redBox.replace(/<[^>]+>/g, '').trim() : '(未找到错误位)';
+        noSessionReject = (redBox !== undefined && redMsg === '');
+        diag = `错误位="${redMsg}"`
+          + ` | 可见文本=${text.slice(0, 400)}`
+          + (kw ? ` || 关键提示=${kw[0]}` : '')
+          + ` || body长度=${raw.length}`;
+      } catch (e) { diag = `(解析响应失败 ${e.message})`; }
+      lastDiag = `第 ${attempt} 次：POST HTTP ${s2.status} | location=${s2.headers.location || '(无)'} | POST set-cookie=${JSON.stringify(s2.headers['set-cookie'] || []).slice(0, 160)} | 预热页 HTTP ${s1.status} set-cookie=${JSON.stringify(s1.headers['set-cookie'] || []).slice(0, 160)} | ${diag}`;
+      console.error(`[CCF] 登录未拿到 uid cookie（${lastDiag}）`);
+    } catch (e) {
+      lastDiag = `第 ${attempt} 次：请求异常 ${e.message}`;
+      console.error(`[CCF] 登录请求异常（${lastDiag}）`);
+    }
+    if (noSessionReject) {
+      console.error('[CCF] 判定为「凭据通过但服务端拒绝下发会话」（错误位为空）→ 不再重试。'
+        + '最常见原因：当前网络 IP 未在 CCF 报备（如家用宽带/手机热点）。'
+        + '请改用报备过的网络（办公室），或联系 CCF 追加报备 IP。');
+      break;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      const wait = 4000 * attempt;
+      console.log(`[CCF] ${Math.round(wait / 1000)}s 后重试登录 (${attempt + 1}/${MAX_ATTEMPTS})`);
+      await sleep(wait);
+    }
   }
-  console.log('[CCF] 登录成功');
-  loggedInCookies = cookies;
-  return cookies;
+  throw new Error(`CCF 登录失败（已重试 ${MAX_ATTEMPTS} 轮）：${lastDiag}`);
 }
 
 // ===== 列表页抓取 =====
@@ -229,15 +316,25 @@ async function fetchContent(cookies, url) {
   if (ncIdx >= 0) {
     const inner = extractBalancedDiv(html, ncIdx);
     const text = cleanText(inner);
-    if (text.length > 0) return text;
+    if (text.length > 0) return isGateText(text) ? '' : text;
   }
   // fallback: 非贪婪匹配
   const ncMatch = html.match(/<div[^>]*id=["']?newscontent["']?[^>]*>([\s\S]*?)<\/div>/i);
-  if (ncMatch) return cleanText(ncMatch[1]);
+  if (ncMatch) { const t = cleanText(ncMatch[1]); return isGateText(t) ? '' : t; }
   // 再 fallback: newsviewtext 容器
   const nvMatch = html.match(/<td[^>]*class=["'][^"']*newsviewtext[^"']*["'][^>]*>([\s\S]*?)<\/td>/i);
-  if (nvMatch) return cleanText(nvMatch[1]);
+  if (nvMatch) { const t = cleanText(nvMatch[1]); return isGateText(t) ? '' : t; }
   return '';
+}
+
+// 「会员可见 / 请登录」拦截页识别（非登录态下正文区返回的就是这类文案）。
+// 命中即视为「无正文」，避免把拦截页当正文送去整合，产出只有标题的空简报。
+function isGateText(text) {
+  if (!text) return true;
+  if (/请登录或注册会员|只对正式会员和试用会员开放|会员登录|登录名\s*密\s*码/.test(text)) return true;
+  // 极短且只含「CCF会员」之类提示
+  if (text.length < 40 && /CCF\s*会员|会员可见|请登录/.test(text)) return true;
+  return false;
 }
 
 function cleanText(html) {
@@ -255,47 +352,87 @@ function cleanText(html) {
 
 // ===== 主入口 =====
 
+// 北京时间（用 UTC getter 读即得北京时间墙上钟）
+function beijingNow() { return new Date(Date.now() + 8 * 3600 * 1000); }
+function bjDateStr(d) { const p = n => String(n).padStart(2, '0'); return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`; }
+
 async function fetchCCFArticles(username, password) {
   const cookies = await login(username, password);
+  const now = beijingNow();
   const all = [];
   const seen = new Set();
 
-  // 只抓一个主列表（所有栏目合并），避免多页重复请求触发限流
-  const col = COLUMNS[0];
-  console.log(`  [CCF] 采集 ${col.name}...`);
-  await sleep(2000 + Math.random() * 2000);
-  const articles = await fetchList(cookies, col.id, col.name);
-  console.log(`    -> ${articles.length} 篇`);
-  for (const a of articles) {
-    const k = a.url;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    all.push(a);
+  // ① 逐栏目抓列表，按各栏目的时间窗过滤后限量取用
+  for (const col of COLUMNS) {
+    console.log(`  [CCF] 采集 ${col.name}（list-${col.id}，回溯 ${col.windowHours}h）...`);
+    await sleep(2000 + Math.random() * 2000);
+    let arts = [];
+    try { arts = await fetchList(cookies, col.id, col.name); }
+    catch (e) { console.error(`    [CCF] ${col.name} 列表失败: ${e.message}`); }
+
+    const winFilter = h => {
+      const from = bjDateStr(new Date(now.getTime() - h * 3600 * 1000));
+      const to = bjDateStr(now);
+      return arts.filter(a => { const d = (a.datetime || '').slice(0, 10); return d >= from && d <= to; });
+    };
+    const from = bjDateStr(new Date(now.getTime() - col.windowHours * 3600 * 1000));
+    const to = bjDateStr(now);
+    const inWindow = winFilter(col.windowHours);
+    let picked = inWindow.slice(0, col.maxArticles);
+    let effWindow = col.windowHours;
+    console.log(`    -> 列表 ${arts.length} 篇，窗口内 ${inWindow.length} 篇，采用 ${picked.length} 篇`);
+    // 窗口内为 0 是异常信号：多半是列表页被 CDN 缓存成旧快照（常见于会话失效时），
+    // 打印列表里的日期分布，便于一眼判断是「站点真没更新」还是「拿到旧页面」。
+    if (arts.length > 0 && inWindow.length === 0) {
+      const dates = [...new Set(arts.map(a => (a.datetime || '?').slice(0, 10)))].sort();
+      console.log(`    [警告] ${col.name} 列表无窗口内文章（窗口 ${from} ~ ${to}），列表内日期：${dates.join(', ')}`);
+    }
+
+    // 节后兜底：日报/速递在 72h 内为空（长假刚过）→ 放宽到 168h 补入假期前最后一个交易日的数据
+    if (picked.length === 0 && col.windowHours > 24 && arts.length > 0) {
+      const widened = winFilter(WIDEN_HOURS).slice(0, WIDEN_MAX);
+      if (widened.length > 0) {
+        const wDates = [...new Set(widened.map(a => (a.datetime || '?').slice(0, 10)))].sort();
+        console.log(`    [窗口放宽] ${col.name} ${col.windowHours}h 内无内容（长假刚过），放宽到 ${WIDEN_HOURS}h 补入 ${widened.length} 篇：${wDates.join(', ')}`);
+        picked = widened;
+        effWindow = WIDEN_HOURS;
+      }
+    }
+
+    for (const a of picked) {
+      if (seen.has(a.url)) continue;
+      seen.add(a.url);
+      a.windowHours = effWindow;   // 供下游做时间窗判断
+      all.push(a);
+    }
   }
 
   console.log(`[CCF] 合计 ${all.length} 篇待采集正文`);
 
-  // 只抓当天的文章正文（避免过多请求）
-  const today = new Date(Date.now() + 8 * 3600000);
-  const cutoff = new Date(today.getFullYear(), today.getMonth(), today.getDate()); // 今天 00:00
-
+  // ② 逐篇抓正文（限流保护：每篇间隔 1.5~2.5s）
   const enriched = [];
+  let contentOk = 0;
   for (let i = 0; i < all.length; i++) {
     const a = all[i];
-    const dtStr = a.datetime.slice(0, 10);
-    const shouldFetch = dtStr >= cutoff.toISOString().slice(0, 10);
-    if (shouldFetch) {
-      await sleep(1500 + Math.random() * 1000); // 增加间隔防429
-      a.content = await fetchContent(cookies, a.url);
-      if (a.content) console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0,30)} (${a.content.length}字)`);
-    } else {
-      a.content = '';
-    }
+    await sleep(1500 + Math.random() * 1000);
+    a.content = await fetchContent(cookies, a.url);
+    if (a.content) { contentOk++; console.log(`  [CCF正文] ${a.source}: ${a.title.slice(0, 30)} (${a.content.length}字)`); }
     enriched.push(a);
-    if ((i + 1) % 5 === 0 && shouldFetch) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}`);
+    // 快速失败：首篇正文就为空 → 会话未真正登录（或被风控），立即报错，省下几十次无用请求
+    if (i === 0 && !a.content) {
+      throw new Error(`CCF 首篇正文为空（${a.url}）——会话未真正登录，或被目标站风控拦截`);
+    }
+    if ((i + 1) % 5 === 0) console.log(`  [CCF] 正文进度 ${i + 1}/${all.length}（成功 ${contentOk}）`);
   }
+
+  // 护栏：有文章却一篇正文都拿不到，说明会话其实未登录（或被风控），
+  // 直接报错退出，避免上游拿着空数据生成一份空简报。
+  if (all.length > 0 && contentOk === 0) {
+    throw new Error(`CCF 正文全部抓取失败（共 ${all.length} 篇，0 篇有内容）——会话很可能未真正登录，或被目标站风控拦截`);
+  }
+  console.log(`[CCF] 正文抓取完成：${contentOk}/${all.length} 篇有内容`);
 
   return enriched;
 }
 
-module.exports = { fetchCCFArticles, login, fetchCCFArticles };
+module.exports = { fetchCCFArticles, login, fetchCCFArticles, COLUMNS, fetchList, fetchContent };
