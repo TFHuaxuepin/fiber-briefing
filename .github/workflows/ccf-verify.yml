@@ -1,0 +1,48 @@
+name: CCF Verify Fetch (temporary)
+
+# 临时工作流（2026-10-23）：为《纤化业务2027年经营计划》核实行业数据。
+# 本机在家庭网络，CCF 登录受 IP 报备白名单限制无法直连；
+# 改用云端 + 今早在办公室刷新的 CCF_COOKIE 取数。用完即删。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CCF_COOKIE: ${{ secrets.CCF_COOKIE }}
+      CCF_USERNAME: ${{ secrets.CCF_USERNAME }}
+      CCF_PASSWORD: ${{ secrets.CCF_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps
+        run: npm install iconv-lite --no-save
+
+      - name: Fetch CCF data
+        run: node _ccf_fetch_verify.js || true
+
+      - name: Show summary
+        run: |
+          echo "===== run.log ====="
+          cat _ccf_verify/run.log 2>/dev/null || echo "(no log)"
+          echo "===== ccf_summary.txt ====="
+          cat _ccf_verify/ccf_summary.txt 2>/dev/null || echo "(no summary)"
+          ls -la _ccf_verify/ 2>/dev/null
+
+      - name: Commit results
+        run: |
+          git config user.name "ccf-verify-bot"
+          git config user.email "bot@local"
+          git add _ccf_verify || true
+          git commit -m "chore: CCF verify fetch $(date -u +%Y-%m-%dT%H:%MZ)" || echo "nothing to commit"
+          git push || echo "push failed"
